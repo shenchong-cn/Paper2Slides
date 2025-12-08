@@ -331,6 +331,16 @@ Paper2Slides/
 
 ---
 
+## 🙏 Related Open-Sourced Projects
+
+- **[LightRAG](https://github.com/HKUDS/LightRAG)**: Graph-Empowered RAG
+- **[RAG-Anything](https://github.com/HKUDS/RAG-Anything)**: Multi-Modal RAG
+- **[VideoRAG](https://github.com/HKUDS/VideoRAG)**: RAG with Extremely-Long Videos
+
+---
+
+---
+
 <div align="center">
 
 **🌟Found Paper2Slides helpful? Star us on GitHub!**
