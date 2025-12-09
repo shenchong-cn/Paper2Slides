@@ -46,8 +46,15 @@ Turns your **research papers**, **reports**, and **documents** into **profession
 ### ⚡ Easy as One Command
 ```bash
 # One command to generate slides from a paper
-python -m paper2slides --input paper.pdf --output slides --style doraemon --length medium --fast
+python -m paper2slides --input paper.pdf --output slides --style doraemon --length medium --fast --parallel 2
 ```
+
+---
+
+## 🔥 News
+
+- **[2025.12.09]** Added parallel slide generation (`--parallel`) for faster processing
+- **[2025.12.08]** Paper2Slides is now open source!
 
 ---
 
@@ -132,6 +139,9 @@ python -m paper2slides --input paper.pdf --output poster --style "minimalist wit
 # Fast mode
 python -m paper2slides --input paper.pdf --output slides --fast
 
+# Enable parallel generation (2 workers by default)
+python -m paper2slides --input paper.pdf --output slides --parallel 2
+
 # List all processed outputs
 python -m paper2slides --list
 ```
@@ -147,6 +157,7 @@ python -m paper2slides --list
 | `--length` | Slides length: `short`, `medium`, `long` | `short` |
 | `--density` | Poster density: `sparse`, `medium`, `dense` | `medium` |
 | `--fast` | Fast mode: skip RAG indexing | `false` |
+| `--parallel` | Enable parallel slide generation: `--parallel` uses 2 workers, `--parallel N` uses N workers | `1` (sequential without this option) |
 | `--from-stage` | Force restart from stage: `rag`, `summary`, `plan`, `generate` | Auto-detect |
 | `--debug` | Enable debug logging | `false` |
 
