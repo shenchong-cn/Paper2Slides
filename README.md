@@ -83,6 +83,15 @@ Examples from <a href="https://arxiv.org/abs/2512.02556">DeepSeek-V3.2: Pushing 
 
 </div>
 
+<details>
+<summary><b>💡 Custom Style Example: Totoro Theme</b></summary>
+
+```
+--style "Studio Ghibli anime style with warm whimsical aesthetic. Use soft watercolor Morandi tones with light cream background, muted sage green and dusty pink accents. Totoro character can appear as a friendly guide relating to the content, with nature elements like soft clouds or leaves."
+```
+
+</details>
+
 ---
 
 ### 🌐 Paper2Slides Web Interface
