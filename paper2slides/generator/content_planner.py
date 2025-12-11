@@ -115,17 +115,21 @@ class ContentPlanner:
         self,
         api_key: str = None,
         base_url: str = None,
-        model: str = "gpt-4o",
+        model: str = None,
     ):
         import os
         self.api_key = api_key or os.getenv("RAG_LLM_API_KEY", "")
         self.base_url = base_url or os.getenv("RAG_LLM_BASE_URL")
-        self.model = model
+        self.model = model or os.getenv("LLM_MODEL", "gpt-4o")
         
         kwargs = {"api_key": self.api_key}
         if self.base_url:
             kwargs["base_url"] = self.base_url
-        self.client = OpenAI(**kwargs)
+        self.client = OpenAI(
+            **kwargs,
+            timeout=60.0,
+            max_retries=3,
+        )
     
     def plan(self, gen_input: GenerationInput) -> ContentPlan:
         """Create a content plan from generation input."""
@@ -289,14 +293,42 @@ class ContentPlanner:
         
         try:
             logger.info(f"Calling {self.model} with max_tokens=16000")
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": content}],
-                max_tokens=16000,
-            )
-            result = response.choices[0].message.content or ""
-            logger.info(f"LLM returned {len(result)} characters")
-            return result
+
+            # 使用 requests 而不是 OpenAI 客户端
+            import requests
+
+            base_url = str(self.client.base_url)
+            if base_url.endswith('/'):
+                url = f"{base_url}chat/completions"
+            else:
+                url = f"{base_url}/chat/completions"
+
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
+
+            data = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": content}],
+                "max_tokens": 16000,
+            }
+
+            response = requests.post(url, headers=headers, json=data, timeout=120)
+            response.raise_for_status()
+
+            result = response.json()
+            logger.info(f"API Response: {result}")
+
+            # 检查响应格式
+            if "choices" in result and len(result["choices"]) > 0:
+                content_text = result["choices"][0].get("message", {}).get("content", "")
+            else:
+                # 可能的替代格式
+                content_text = result.get("content", "") or result.get("response", "") or str(result)
+
+            logger.info(f"LLM returned {len(content_text)} characters")
+            return content_text
         except Exception as e:
             logger.error(f"LLM API call failed: {e}")
             logger.error(f"Model: {self.model}, Content items: {len(content)}")

@@ -28,7 +28,15 @@ async def run_summary_stage(base_dir: Path, config: Dict) -> Dict:
     
     api_key = os.getenv("RAG_LLM_API_KEY", "")
     base_url = os.getenv("RAG_LLM_BASE_URL")
-    llm_client = OpenAI(api_key=api_key, base_url=base_url)
+    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+    # 创建 OpenAI 客户端，添加一些额外的配置来兼容自定义 API
+    llm_client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=60.0,  # 增加超时时间
+        max_retries=3,  # 设置重试次数
+    )
     
     logger.info(f"Extracting content from indexed documents ({content_type})...")
     
@@ -41,7 +49,7 @@ async def run_summary_stage(base_dir: Path, config: Dict) -> Dict:
             paper_metadata = await extract_paper_metadata_from_markdown(
                 markdown_paths=markdown_paths,
                 llm_client=llm_client,
-                model="gpt-4o-mini",
+                model=model,
                 max_chars_per_file=3000
             )
             
@@ -58,7 +66,7 @@ async def run_summary_stage(base_dir: Path, config: Dict) -> Dict:
         content = await extract_paper(
             rag_results=rag_results,
             llm_client=llm_client,
-            model="gpt-4o-mini",
+            model=model,
             parallel=True,
             max_concurrency=5,
         )
@@ -70,7 +78,7 @@ async def run_summary_stage(base_dir: Path, config: Dict) -> Dict:
         content = await extract_general(
             rag_results=all_results,
             llm_client=llm_client,
-            model="gpt-4o-mini",
+            model=model,
         )
         summary_text = content.content
     

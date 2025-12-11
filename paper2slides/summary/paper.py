@@ -351,17 +351,34 @@ async def extract_paper_metadata_from_markdown(
         # Multiple files: complex multi-scenario prompt
         prompt = _build_multi_file_prompt(file_headers)
     
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: llm_client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1500,
-            temperature=0.1,  # Low temperature for accuracy
-        )
-    )
-    
-    result = response.choices[0].message.content or ""
+    # 使用自定义 requests 客户端而不是 OpenAI 客户端
+    import requests
+
+    # 从 llm_client 获取 API 配置
+    api_key = llm_client.api_key
+    base_url = str(llm_client.base_url)
+
+    # 确保 URL 格式正确，避免双斜杠
+    if base_url.endswith('/'):
+        url = f"{base_url}chat/completions"
+    else:
+        url = f"{base_url}/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+
+    data = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1500,
+        "temperature": 0.1
+    }
+
+    response = requests.post(url, headers=headers, json=data, timeout=60)
+    response.raise_for_status()
+
+    result = response.json()
+    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
     
     return result

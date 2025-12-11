@@ -323,8 +323,14 @@ async def run_rag_stage(base_dir: Path, config: Dict) -> Dict:
         
         api_key = os.getenv("RAG_LLM_API_KEY", "")
         base_url = os.getenv("RAG_LLM_BASE_URL")
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        
+        model = os.getenv("LLM_MODEL", "gpt-4o")
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=60.0,
+            max_retries=3,
+        )
+
         # Execute queries (direct GPT-4o with images in original positions)
         if content_type == "paper":
             rag_results = await _run_fast_queries_by_category(
@@ -332,6 +338,7 @@ async def run_rag_stage(base_dir: Path, config: Dict) -> Dict:
                 markdown_content="",  # Not used anymore, content is processed inside
                 markdown_paths=markdown_paths,
                 queries_by_category=RAG_PAPER_QUERIES,
+                model=model,
             )
         else:
             raise ValueError("Fast mode currently only supports content_type='paper'")

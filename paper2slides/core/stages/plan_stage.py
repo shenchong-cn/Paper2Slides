@@ -59,8 +59,9 @@ async def run_plan_stage(base_dir: Path, config_dir: Path, config: Dict) -> Dict
     logger.info("Planning content...")
     api_key = os.getenv("RAG_LLM_API_KEY", "")
     base_url = os.getenv("RAG_LLM_BASE_URL")
-    
-    planner = ContentPlanner(api_key=api_key, base_url=base_url, model="gpt-4o")
+    model = os.getenv("LLM_MODEL", "gpt-4o")
+
+    planner = ContentPlanner(api_key=api_key, base_url=base_url, model=model)
     plan = planner.plan(gen_input)
     
     logger.info(f"  Generated {len(plan.sections)} sections:")
