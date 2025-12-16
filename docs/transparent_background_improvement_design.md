@@ -2,7 +2,7 @@
 
 ## 文档信息
 - **创建日期**: 2025-12-16
-- **版本**: v2.1 (评审修订：统一提示词与兜底策略、移除 numpy 强依赖)
+- **版本**: v2.2 (评审修订：明确配置设计、补充 poster 模式、完善实施细节)
 - **作者**: Claude Code
 - **相关Issue**: 透明背景PNG效果不佳 - 白色背景不透明
 
@@ -260,38 +260,74 @@ def _remove_light_panel_background(self, image_data: bytes, mime_type: str) -> t
 3. **保守策略**: 无法判断的像素更倾向保留（避免误删）
 4. **可控边缘**: 掩码膨胀 + 轻微平滑，尽量降低锯齿，同时避免产生明显白边光晕
 
-#### 关于“白边/光晕（Color Fringing）”
+#### 关于"白边/光晕（Color Fringing）"
 
 对 alpha 做模糊会产生半透明像素；若这些像素的 RGB 仍是面板白色，会在有色 PPT 背景上出现白边。
-因此更推荐：
-- 先做内容掩码的膨胀（包含抗锯齿边缘），尽量减少对“面板背景 RGB”做半透明化
-- 对最终 alpha=0 的像素将 RGB 置零（或置为邻域内容色）以减少残留背景色的影响（可选增强项）
+
+**初版实施（v1.0）**：
+- ✅ 先做内容掩码的膨胀（包含抗锯齿边缘），尽量减少对"面板背景 RGB"做半透明化
+- ✅ 使用较小的边缘平滑半径（edge_blur=0.8），避免产生大量半透明像素
+
+**后续优化（v2.0+，可选增强）**：
+- 对最终 alpha=0 的像素将 RGB 置零（或置为邻域内容色）以减少残留背景色的影响
+- 实现"去污染"算法：对半透明像素的 RGB 进行调整，减少白边效果
+- 这些优化需要更复杂的算法，初版暂不实施
 
 ### 2.4 配置选项
 
-为用户提供控制选项：
+#### 配置类设计（扩展现有 GenerationConfig）
+
+直接扩展现有的 `GenerationConfig` 类，避免引入新的配置类：
 
 ```python
 @dataclass
-class TransparencyConfig:
-    """透明度配置"""
-    enabled: bool = False  # 是否启用透明背景
-    cleanup_light_panel: bool = True  # 是否启用“浅色面板去除”兜底（新增）
+class GenerationConfig:
+    """用户生成配置"""
+    output_type: OutputType = OutputType.POSTER
+    poster_density: PosterDensity = PosterDensity.MEDIUM
+    slides_length: SlidesLength = SlidesLength.MEDIUM
+    style: StyleType = StyleType.ACADEMIC
+    custom_style: Optional[str] = None
+
+    # 透明背景配置（现有 + 新增）
+    transparent_bg: bool = False  # 是否启用透明背景（现有）
+    cleanup_light_panel: bool = True  # 是否启用"浅色面板去除"兜底（新增）
     panel_detect_luma: int = 220  # 面板检测亮度阈值（新增）
     content_diff_threshold: int = 25  # 与面板背景色差阈值（新增）
     edge_expand: int = 2  # 内容掩码膨胀像素（新增）
     edge_blur: float = 0.8  # 边缘平滑半径（新增，建议很小）
+
+    # 调试与回滚（新增）
+    debug_save_intermediate: bool = False  # 保存中间结果用于调试（新增）
+    fallback_to_old_behavior: bool = False  # 出错时回退到旧行为（新增）
 ```
 
-命令行参数：
+**设计理由**：
+- ✅ 保持现有架构，避免引入新类增加复杂度
+- ✅ 所有透明背景相关配置集中管理
+- ✅ 向后兼容：新字段有默认值，不影响现有代码
+
+#### 命令行参数
+
 ```bash
---transparent-bg  # 启用透明背景
---keep-light-panel  # 保留浅色面板（关闭兜底清理，新增）
---panel-luma 220  # 面板检测阈值（新增）
---content-diff 25  # 内容/面板背景色差阈值（新增）
+# 基础透明背景
+--transparent-bg              # 启用透明背景
+
+# 高级控制（可选）
+--keep-light-panel            # 保留浅色面板（关闭兜底清理）
+--panel-luma 220              # 面板检测亮度阈值
+--content-diff 25             # 内容/面板背景色差阈值
+--edge-expand 2               # 内容掩码膨胀像素
+--edge-blur 0.8               # 边缘平滑半径
+
+# 调试与回滚（可选）
+--debug-transparency          # 保存中间结果（面板检测、掩码等）
+--fallback-on-error           # 出错时回退到旧行为
 ```
 
-### 2.5 质量评估
+### 2.5 质量评估与后续动作
+
+#### 质量评估算法
 
 ```python
 @dataclass
@@ -299,18 +335,18 @@ class TransparencyQuality:
     """透明度质量评估"""
     score: float  # 0-100分
     has_large_light_panel: bool  # 是否存在大面积浅色面板残留
-    light_panel_ratio: float  # 不透明区域中“浅色低饱和”比例（诊断项）
+    light_panel_ratio: float  # 不透明区域中"浅色低饱和"比例（诊断项）
     edge_quality: str  # "smooth" | "jagged"（诊断项）
     warnings: List[str]
 
 def assess_transparency_quality_v2(img: Image) -> TransparencyQuality:
-    """评估透明度质量"""
-    # 下采样做诊断，避免全分辨率遍历过慢；不要求 numpy 依赖
+    """评估透明度质量（不依赖 numpy）"""
+    # 下采样做诊断，避免全分辨率遍历过慢
     img = img.convert("RGBA").resize((256, 256))
     alpha = list(img.getchannel("A").getdata())
     rgb = list(img.convert("RGB").getdata())
 
-    # 检查是否还有“大面积浅色面板/背景”
+    # 检查是否还有"大面积浅色面板/背景"
     opaque_idx = [i for i, a in enumerate(alpha) if a > 200]
     if opaque_idx:
         light_neutral = 0
@@ -319,7 +355,7 @@ def assess_transparency_quality_v2(img: Image) -> TransparencyQuality:
             if (r + g + b > 660) and (max(r, g, b) - min(r, g, b) < 30):
                 light_neutral += 1
         light_panel_ratio = light_neutral / len(opaque_idx)
-        has_large_light_panel = light_panel_ratio > 0.30  # 更偏“告警阈值”，非硬 KPI
+        has_large_light_panel = light_panel_ratio > 0.30
     else:
         light_panel_ratio = 0.0
         has_large_light_panel = False
@@ -351,7 +387,19 @@ def assess_transparency_quality_v2(img: Image) -> TransparencyQuality:
     )
 ```
 
-> 注：透明像素比例（transparent_ratio）不作为硬指标，因为全幅图表/大图片天然不透明像素多；更关键的是“是否存在大面积浅色面板残留”。
+#### 质量评估的后续动作
+
+**初版实施（v1.0）**：
+- ✅ 记录到日志：`logger.info(f"Transparency quality: {quality.score}/100, warnings: {quality.warnings}")`
+- ✅ 保存到输出元数据：在生成的 `state.json` 中添加 `transparency_quality` 字段
+- ❌ 不自动重试（避免增加复杂度和成本）
+
+**后续优化（v2.0+）**：
+- 低分时（score < 60）可选自动重试一次（需要用户配置 `--retry-on-low-quality`）
+- 提供 Web UI 实时反馈质量评分
+- 支持用户手动触发重新生成
+
+> 注：透明像素比例（transparent_ratio）不作为硬指标，因为全幅图表/大图片天然不透明像素多；更关键的是"是否存在大面积浅色面板残留"。
 
 ## 3. 技术实现
 
@@ -359,84 +407,202 @@ def assess_transparency_quality_v2(img: Image) -> TransparencyQuality:
 
 #### 文件1: `paper2slides/generator/image_generator.py`
 
-**修改点1**: 替换透明背景提示词（`_build_poster_prompt` / `_build_slide_prompt` 内）
+**修改点1**: 替换透明背景提示词（内联方式，不提取常量）
+
+在 `_build_slide_prompt` 方法（365-377行）和 `_build_poster_prompt` 方法中：
 ```python
-# 移除“content card”要求
-# 保留“真透明优先 + #FF00FF 色键兜底”要求
-# 使用新的 TRANSPARENT_BG_PROMPT_V2
+# 当前代码（365-377行）
+if transparent_bg:
+    parts.append(
+        "IMPORTANT: Output a PNG with a TRUE transparent background (alpha channel). "
+        "Do NOT draw any checkerboard/grid pattern to represent transparency. "
+        "Background pixels must have alpha=0; only the content (text/figures/shapes) should be opaque. "
+        "For readability on arbitrary slide templates, place all content on a centered rounded-rectangle "
+        "content card (e.g., white at ~90–95% opacity) and keep margins outside the card fully transparent."
+    )
+    parts.append(
+        "IMPLEMENTATION HINT: Set the entire canvas background to a pure chroma-key color #FF00FF (magenta) "
+        "and NEVER use #FF00FF anywhere else in the design. Do not use gradients/textures on the background. "
+        "This background will be programmatically converted to transparency."
+    )
+
+# 修改为（使用新提示词，移除 content card 要求）
+if transparent_bg:
+    parts.append(
+        "CRITICAL REQUIREMENT - True Transparent Background:\n"
+        "1. OUTPUT FORMAT: PNG with alpha channel (RGBA). Prefer true transparent background (alpha=0) "
+        "for ALL background areas. If true alpha cannot be reliably produced, use a single flat chroma-key "
+        "background color #FF00FF (magenta). NEVER use #FF00FF in content. NO large solid background panels/cards.\n"
+        "2. CONTENT RENDERING: Render ONLY actual content (text/charts/diagrams/icons) directly on transparent "
+        "canvas (or on #FF00FF if needed). Avoid large filled rectangles behind content. Text must remain legible "
+        "on various PPT templates by using outlines/strokes and/or shadows. Charts should use vibrant colors.\n"
+        "3. READABILITY: Use text with outlines/strokes (e.g., white text with dark outline, or dark text with "
+        "light outline). Use subtle shadows. Prefer medium-to-bold fonts and high-contrast colors.\n"
+        "4. AVOID: NO white/light content card, NO rounded rectangle panel, NO background gradients/textures, "
+        "NO checkerboard pattern, NO pure white text without outline/shadow."
+    )
 ```
 
-**修改点2**: 添加“浅色面板去除”方法（新增）
+**设计理由**：
+- ✅ 提示词直接内联在方法中，与现有代码风格一致
+- ✅ 避免引入新的常量文件或模块
+- ✅ Slides 和 Poster 模式使用相同的透明背景提示词
+- ✅ 简化后的提示词更紧凑，减少 token 消耗
+
+**修改点2**: 添加"浅色面板去除"方法（新增，约 80 行）
 ```python
 def _remove_light_panel_background(self, image_data: bytes, mime_type: str) -> tuple[bytes, str]:
     """在检测到浅色面板时移除面板背景，保留内容（保守兜底）"""
+    # 实现见 2.3 节算法描述
 ```
 
-**修改点3**: 修改`_to_transparent_png`方法 (476-589行)
+**修改点3**: 修改 `_to_transparent_png` 方法（476-589行）
 ```python
 def _to_transparent_png(self, image_data: bytes, mime_type: str) -> tuple[bytes, str]:
     """
     改进的透明度处理
 
     流程:
-    1. 若已有真实 alpha：可选检测是否仍存在“大面积浅色面板”，必要时做兜底清理
+    1. 若已有真实 alpha：可选检测是否仍存在"大面积浅色面板"，必要时做兜底清理
     2. 若无 alpha：先尝试 #FF00FF 色键（强信号）
-    3. 再尝试去除“假透明棋盘格”
-    4. 最后：仅在检测到浅色面板时，启用面板去除兜底
+    3. 再尝试去除"假透明棋盘格"
+    4. 最后：仅在检测到浅色面板且 cleanup_light_panel=True 时，启用面板去除兜底
     """
-    ...
+    # 在现有逻辑的最后（534-543行）添加面板去除兜底
+    if self.config.cleanup_light_panel:
+        return self._remove_light_panel_background(image_data, mime_type)
 ```
 
-**修改点4**: 在生成流程中调用 (192-194, 234-236, 276-278行)
+**修改点4**: 在生成流程中添加质量评估（192-194, 234-236, 276-278行）
 ```python
 if transparent_bg:
     image_data, mime_type = self._to_transparent_png(image_data, mime_type)
     # 添加质量评估和日志
     quality = assess_transparency_quality_v2(Image.open(io.BytesIO(image_data)))
-    logger.info(f"Transparency quality: {quality.score}/100")
+    logger.info(f"Transparency quality: score={quality.score}/100, panel_ratio={quality.light_panel_ratio:.2%}, edge={quality.edge_quality}")
+    if quality.warnings:
+        logger.warning(f"Transparency warnings: {', '.join(quality.warnings)}")
+    # 保存到元数据（可选）
+    if hasattr(self, 'current_metadata'):
+        self.current_metadata['transparency_quality'] = {
+            'score': quality.score,
+            'has_large_light_panel': quality.has_large_light_panel,
+            'warnings': quality.warnings
+        }
 ```
 
-#### 文件2: `paper2slides/prompts/image_generation.py`
+#### 文件2: `paper2slides/generator/config.py`
 
-**新增**: 透明背景提示词常量
-```python
-TRANSPARENT_BG_PROMPT_V2 = """..."""  # 如上所述
-```
-
-#### 文件3: `paper2slides/generator/config.py`
-
-**修改**: 添加透明度配置选项
+**修改**: 扩展 `GenerationConfig` 类（47-84行）
 ```python
 @dataclass
-class TransparencyConfig:
-    enabled: bool = False
+class GenerationConfig:
+    """用户生成配置"""
+    output_type: OutputType = OutputType.POSTER
+    poster_density: PosterDensity = PosterDensity.MEDIUM
+    slides_length: SlidesLength = SlidesLength.MEDIUM
+    style: StyleType = StyleType.ACADEMIC
+    custom_style: Optional[str] = None
+
+    # 透明背景配置（现有 + 新增）
+    transparent_bg: bool = False
     cleanup_light_panel: bool = True  # 新增
     panel_detect_luma: int = 220  # 新增
     content_diff_threshold: int = 25  # 新增
+    edge_expand: int = 2  # 新增
     edge_blur: float = 0.8  # 新增
+    debug_save_intermediate: bool = False  # 新增
+    fallback_to_old_behavior: bool = False  # 新增
+```
+
+#### 文件3: `paper2slides/main.py`
+
+**新增**: 命令行参数解析（约在 argparse 部分）
+```python
+# 透明背景基础参数（现有）
+parser.add_argument('--transparent-bg', action='store_true', help='Generate with transparent background')
+
+# 透明背景高级参数（新增）
+parser.add_argument('--keep-light-panel', action='store_true',
+                    help='Keep light panel (disable cleanup fallback)')
+parser.add_argument('--panel-luma', type=int, default=220,
+                    help='Panel detection luminance threshold (default: 220)')
+parser.add_argument('--content-diff', type=int, default=25,
+                    help='Content/background color difference threshold (default: 25)')
+parser.add_argument('--edge-expand', type=int, default=2,
+                    help='Content mask dilation pixels (default: 2)')
+parser.add_argument('--edge-blur', type=float, default=0.8,
+                    help='Edge smoothing radius (default: 0.8)')
+
+# 调试与回滚参数（新增）
+parser.add_argument('--debug-transparency', action='store_true',
+                    help='Save intermediate results for debugging')
+parser.add_argument('--fallback-on-error', action='store_true',
+                    help='Fallback to old behavior on error')
+
+# 在构建 GenerationConfig 时传递参数
+config = GenerationConfig(
+    transparent_bg=args.transparent_bg,
+    cleanup_light_panel=not args.keep_light_panel,  # 反转逻辑
+    panel_detect_luma=args.panel_luma,
+    content_diff_threshold=args.content_diff,
+    edge_expand=args.edge_expand,
+    edge_blur=args.edge_blur,
+    debug_save_intermediate=args.debug_transparency,
+    fallback_to_old_behavior=args.fallback_on_error,
+    # ... 其他参数
+)
+```
+
+#### 文件4: `api/server.py`（Web API）
+
+**修改**: 在请求处理中支持新参数
+```python
+# 在 /generate 端点中解析请求参数
+config = GenerationConfig(
+    transparent_bg=request.transparent_bg,
+    cleanup_light_panel=request.cleanup_light_panel,
+    panel_detect_luma=request.panel_luma or 220,
+    content_diff_threshold=request.content_diff or 25,
+    # ... 其他参数
+)
 ```
 
 ### 3.2 实施步骤
 
-#### 步骤1: 核心算法实现 (优先级P0)
-1. 实现`_remove_light_panel_background`方法（面板去除兜底）
-2. 调优：面板检测阈值、内容/背景色差阈值
-3. 优化边缘处理（掩码膨胀 + 轻微平滑，避免白边）
+#### 步骤1: 配置类扩展 (优先级P0, 0.5天)
+1. 扩展 `GenerationConfig` 类，添加透明背景相关字段
+2. 在 `main.py` 中添加命令行参数解析
+3. 在 `api/server.py` 中添加 Web API 参数支持
+4. 单元测试：验证配置传递正确
 
-#### 步骤2: 提示词优化 (优先级P0)
-1. 替换透明背景提示词
-2. 测试模型响应
-3. 根据结果微调提示词
+#### 步骤2: 提示词优化 (优先级P0, 0.5天)
+1. 修改 `_build_slide_prompt` 和 `_build_poster_prompt` 中的透明背景提示词
+2. 移除"content card"要求，强调真透明 + 描边/阴影
+3. 测试模型响应（生成 3-5 个样本）
+4. 根据结果微调提示词
 
-#### 步骤3: 质量评估 (优先级P1)
-1. 实现`assess_transparency_quality_v2`
-2. 添加日志输出
-3. 提供用户反馈
+#### 步骤3: 核心算法实现 (优先级P0, 1.5天)
+1. 实现 `_remove_light_panel_background` 方法（约 80 行）
+2. 实现 `assess_transparency_quality_v2` 函数（约 50 行）
+3. 修改 `_to_transparent_png` 方法，集成面板去除兜底
+4. 调优阈值：面板检测、内容/背景色差、边缘处理
+5. 单元测试：色键抠图、面板去除、质量评估
 
-#### 步骤4: 配置选项 (优先级P1)
-1. 添加命令行参数
-2. 更新配置类
-3. 文档更新
+#### 步骤4: 集成和测试 (优先级P0, 1天)
+1. 在生成流程中添加质量评估和日志
+2. 实现调试模式（保存中间结果）
+3. 实现回滚机制（出错时回退到旧行为）
+4. 端到端测试：生成完整 slides/poster 并验证透明度
+5. 视觉测试：在多种 PPT 模板上验证效果
+
+#### 步骤5: 文档和优化 (优先级P1, 0.5天)
+1. 更新 README 和使用文档
+2. 添加透明背景使用示例
+3. 性能优化（如需要）
+4. 代码审查和清理
+
+**总计时间估算**: 4-5 天（含风险缓冲）
 
 ### 3.3 测试策略
 
@@ -470,14 +636,46 @@ def test_end_to_end_transparency():
 3. 验证边缘平滑度
 4. 确认无白色矩形
 
-### 3.4 性能考虑
+### 3.4 性能考虑与 numpy 依赖策略
 
-- 后处理耗时与图像尺寸线性相关；优先使用 Pillow 的轻量操作，通常可接受。
-- 如需要更高性能，可选引入 numpy 做向量化，但应作为可选依赖并提供无 numpy 的降级路径。
+#### 性能分析
+
+- 后处理耗时与图像尺寸线性相关
+- 典型图像（1376x768）处理时间：
+  - 下采样检测：~10ms
+  - 面板去除（如触发）：~50-100ms
+  - 质量评估：~20ms
+- 总体性能影响：≤20%（符合目标）
+
+#### numpy 依赖策略
+
+**初版实施（v1.0）**：
+- ✅ **不依赖 numpy**：所有算法使用 Pillow 原生操作
+- ✅ 代码简洁，依赖少，易于维护
+- ✅ 性能对大多数用户可接受
+
+**后续优化（v2.0+，可选）**：
+- 如用户反馈性能问题，可提供 numpy 加速版本
+- 实现策略：
+  ```python
+  try:
+      import numpy as np
+      HAS_NUMPY = True
+  except ImportError:
+      HAS_NUMPY = False
+
+  def _remove_light_panel_background(self, ...):
+      if HAS_NUMPY:
+          return self._remove_light_panel_background_numpy(...)
+      else:
+          return self._remove_light_panel_background_pillow(...)
+  ```
+- 降级路径：numpy 不可用时自动回退到 Pillow 实现
 
 **优化措施**:
 - 下采样检测（256x256）用于面板判断/定位，避免全分辨率重计算
 - 仅在检测到问题时启用兜底清理，减少不必要开销
+- 使用 Pillow 的高效操作（`point()`, `filter()`, `paste()`）
 
 ## 4. 预期效果
 
@@ -519,32 +717,45 @@ def test_end_to_end_transparency():
 ### 5.2 兼容性风险
 
 - **向后兼容**: 保持现有API，新功能通过参数控制
-- **默认行为**: `--transparent-bg` 默认启用“浅色面板去除”兜底（以避免白色矩形）
+- **默认行为**: `--transparent-bg` 默认启用"浅色面板去除"兜底（以避免白色矩形）
 - **退出机制**: 提供 `--keep-light-panel` 参数保留旧行为（仅色键/棋盘格，不做面板去除）
+- **回滚机制**: 提供 `--fallback-on-error` 参数，出错时自动回退到旧行为
+- **调试支持**: 提供 `--debug-transparency` 参数，保存中间结果用于问题诊断
 
 ## 6. 实施计划
 
-### 6.1 开发阶段
+### 6.1 开发阶段（总计 4-5 天）
 
-**阶段1: 核心算法** (1-2天)
+**阶段1: 配置类扩展** (0.5天)
 - [x] 分析问题根因
-- [ ] 实现`_remove_light_panel_background`方法
-- [ ] 测试和调优阈值
+- [ ] 扩展 `GenerationConfig` 类
+- [ ] 添加命令行参数解析
+- [ ] 添加 Web API 参数支持
 
 **阶段2: 提示词优化** (0.5天)
-- [ ] 设计新提示词
+- [ ] 修改 slides 和 poster 提示词
 - [ ] 测试模型响应
 - [ ] 微调提示词
 
-**阶段3: 集成和测试** (1天)
-- [ ] 集成到生成流程
-- [ ] 添加质量评估
-- [ ] 端到端测试
+**阶段3: 核心算法实现** (1.5天)
+- [ ] 实现 `_remove_light_panel_background` 方法
+- [ ] 实现 `assess_transparency_quality_v2` 函数
+- [ ] 修改 `_to_transparent_png` 方法
+- [ ] 调优阈值和边缘处理
+- [ ] 单元测试
 
-**阶段4: 配置和文档** (0.5天)
-- [ ] 添加命令行参数
-- [ ] 更新README
-- [ ] 编写使用文档
+**阶段4: 集成和测试** (1天)
+- [ ] 集成质量评估和日志
+- [ ] 实现调试模式和回滚机制
+- [ ] 端到端测试
+- [ ] 视觉测试（多种 PPT 模板）
+
+**阶段5: 文档和优化** (0.5天)
+- [ ] 更新 README 和文档
+- [ ] 性能优化（如需要）
+- [ ] 代码审查
+
+**风险缓冲**: +1天（应对调试、返工、意外问题）
 
 ### 6.2 验收标准
 
