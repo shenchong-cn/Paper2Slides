@@ -334,7 +334,9 @@ class ImageGenerator:
             parts.append(
                 "IMPORTANT: Output a PNG with a TRUE transparent background (alpha channel). "
                 "Do NOT draw any checkerboard/grid pattern to represent transparency. "
-                "Background pixels must have alpha=0; only the content (text/figures/shapes) should be opaque."
+                "Background pixels must have alpha=0; only the content (text/figures/shapes) should be opaque. "
+                "For readability on arbitrary slide templates, place all content on a centered rounded-rectangle "
+                "content card (e.g., white at ~90–95% opacity) and keep margins outside the card fully transparent."
             )
 
         if style_name == "custom" and processed_style:
@@ -359,7 +361,9 @@ class ImageGenerator:
             parts.append(
                 "IMPORTANT: Output a PNG with a TRUE transparent background (alpha channel). "
                 "Do NOT draw any checkerboard/grid pattern to represent transparency. "
-                "Background pixels must have alpha=0; only the content (text/figures/shapes) should be opaque."
+                "Background pixels must have alpha=0; only the content (text/figures/shapes) should be opaque. "
+                "For readability on arbitrary slide templates, place all content on a centered rounded-rectangle "
+                "content card (e.g., white at ~90–95% opacity) and keep margins outside the card fully transparent."
             )
 
         if style_name == "custom" and processed_style:
@@ -487,7 +491,20 @@ class ImageGenerator:
         alpha = img_rgba.getchannel("A")
         a_min, a_max = alpha.getextrema()
 
-        # Already has real transparency; just normalize to PNG.
+        # If the model returns alpha but uses global semi-transparency, it looks washed out in PPT.
+        # Harden alpha unless there's a meaningful fully-transparent background already.
+        if a_min < 255:
+            sample = alpha.resize((256, 256)).getdata()
+            n = 256 * 256
+            zero = sum(1 for x in sample if x == 0) / n
+            mid = sum(1 for x in sample if 0 < x < 255) / n
+            if mid > 0.10 and zero < 0.02:
+                hardened = alpha.point(lambda x: 0 if x == 0 else 255)
+                img_rgba.putalpha(hardened)
+                alpha = img_rgba.getchannel("A")
+                a_min, a_max = alpha.getextrema()
+
+        # Already has real transparency; normalize to PNG.
         if a_min < 255:
             buf = io.BytesIO()
             img_rgba.save(buf, format="PNG")
@@ -501,14 +518,20 @@ class ImageGenerator:
             img_rgba.save(buf, format="PNG")
             return buf.getvalue(), "image/png"
 
-        bg1 = bg_colors[0]
-        bg2 = bg_colors[1] if len(bg_colors) > 1 else bg_colors[0]
+        # Require 2 distinct colors; otherwise it may just be a real solid background or card panel.
+        if len(bg_colors) < 2:
+            buf = io.BytesIO()
+            img_rgba.save(buf, format="PNG")
+            return buf.getvalue(), "image/png"
+
+        bg1, bg2 = bg_colors[0], bg_colors[1]
         w, h = rgb.size
         rgb_bytes = rgb.tobytes()
 
-        # Soft keying to reduce halos on anti-aliased edges.
-        t0 = 6   # fully transparent threshold
-        t1 = 80  # fully opaque threshold
+        # Conservative keying: only remove near-background, light-neutral pixels.
+        # This avoids washing out colored content when the model didn't actually return transparency.
+        t0 = 8    # fully transparent threshold
+        t1 = 28   # fully opaque threshold
 
         out = bytearray(w * h * 4)
         oi = 0
@@ -521,12 +544,14 @@ class ImageGenerator:
             d2 = abs(r - bg2[0]) + abs(g - bg2[1]) + abs(b - bg2[2])
             d = d1 if d1 < d2 else d2
 
-            if d <= t0:
+            # Only treat it as background if it's light/neutral (i.e., checkerboard-like).
+            is_neutral = (max(r, g, b) - min(r, g, b) <= 18) and (r + g + b >= 640)
+            if is_neutral and d <= t0:
                 a = 0
-            elif d >= t1:
-                a = 255
-            else:
+            elif is_neutral and d < t1:
                 a = int((d - t0) * 255 / (t1 - t0))
+            else:
+                a = 255
 
             out[oi] = r
             out[oi + 1] = g
@@ -588,6 +613,15 @@ class ImageGenerator:
                 chosen.append(c)
             if len(chosen) >= 2:
                 break
+
+        if len(chosen) < 2:
+            return []
+
+        # Ensure the second color is not just noise.
+        c1, c2 = chosen[0], chosen[1]
+        n1, n2 = counts.get(c1, 0), counts.get(c2, 0)
+        if n2 == 0 or (n2 / max(1, n1)) < 0.25:
+            return []
 
         return chosen
     
