@@ -338,6 +338,11 @@ class ImageGenerator:
                 "For readability on arbitrary slide templates, place all content on a centered rounded-rectangle "
                 "content card (e.g., white at ~90–95% opacity) and keep margins outside the card fully transparent."
             )
+            parts.append(
+                "IMPLEMENTATION HINT: Set the entire canvas background to a pure chroma-key color #FF00FF (magenta) "
+                "and NEVER use #FF00FF anywhere else in the design. Do not use gradients/textures on the background. "
+                "This background will be programmatically converted to transparency."
+            )
 
         if style_name == "custom" and processed_style:
             parts.append(f"Style: {self._format_custom_style_for_poster(processed_style)}")
@@ -364,6 +369,11 @@ class ImageGenerator:
                 "Background pixels must have alpha=0; only the content (text/figures/shapes) should be opaque. "
                 "For readability on arbitrary slide templates, place all content on a centered rounded-rectangle "
                 "content card (e.g., white at ~90–95% opacity) and keep margins outside the card fully transparent."
+            )
+            parts.append(
+                "IMPLEMENTATION HINT: Set the entire canvas background to a pure chroma-key color #FF00FF (magenta) "
+                "and NEVER use #FF00FF anywhere else in the design. Do not use gradients/textures on the background. "
+                "This background will be programmatically converted to transparency."
             )
 
         if style_name == "custom" and processed_style:
@@ -510,10 +520,24 @@ class ImageGenerator:
             img_rgba.save(buf, format="PNG")
             return buf.getvalue(), "image/png"
 
-        # No transparency at all; attempt to remove a fake checkerboard background.
+        # No transparency at all; try chroma-key first (if the model followed instructions).
         rgb = img_rgba.convert("RGB")
+        keyed = self._key_out_chroma(rgb, key_rgb=(255, 0, 255), tol=18)
+        if keyed is not None:
+            buf = io.BytesIO()
+            keyed.save(buf, format="PNG")
+            return buf.getvalue(), "image/png"
+
+        # Attempt to remove a fake checkerboard background (common "fake transparency").
         bg_colors = self._detect_checkerboard_background_colors(rgb)
         if not bg_colors:
+            # Fallback: extract a large light "content card" and make outside transparent.
+            card_overlay = self._extract_content_card_overlay(img_rgba)
+            if card_overlay is not None:
+                buf = io.BytesIO()
+                card_overlay.save(buf, format="PNG")
+                return buf.getvalue(), "image/png"
+
             buf = io.BytesIO()
             img_rgba.save(buf, format="PNG")
             return buf.getvalue(), "image/png"
@@ -565,9 +589,117 @@ class ImageGenerator:
         return buf.getvalue(), "image/png"
 
     @staticmethod
+    def _key_out_chroma(rgb_img, key_rgb: tuple[int, int, int], tol: int = 18):
+        """
+        If the key color appears on the image border, remove it by setting alpha=0.
+
+        Returns an RGBA Image if chroma-keying was applied; otherwise None.
+        """
+        try:
+            from PIL import Image, ImageChops, ImageOps, ImageFilter
+        except Exception:
+            return None
+
+        w, h = rgb_img.size
+        if w < 10 or h < 10:
+            return None
+
+        px = rgb_img.load()
+        step = max(1, min(w, h) // 200)
+        margin = max(1, min(w, h) // 150)
+
+        def close(c):
+            return (
+                abs(c[0] - key_rgb[0]) <= tol
+                and abs(c[1] - key_rgb[1]) <= tol
+                and abs(c[2] - key_rgb[2]) <= tol
+            )
+
+        border = []
+        for x in range(margin, w - margin, step):
+            border.append(px[x, margin])
+            border.append(px[x, h - 1 - margin])
+        for y in range(margin, h - margin, step):
+            border.append(px[margin, y])
+            border.append(px[w - 1 - margin, y])
+
+        if not border:
+            return None
+
+        ratio = sum(1 for c in border if close(c)) / len(border)
+        if ratio < 0.06:
+            return None
+
+        solid = Image.new("RGB", (w, h), key_rgb)
+        diff = ImageChops.difference(rgb_img, solid)
+        diff_g = ImageOps.grayscale(diff)
+        key_mask = diff_g.point(lambda p: 255 if p <= tol else 0)
+        # Slight blur helps reduce jagged keyed edges from compression artifacts.
+        key_mask = key_mask.filter(ImageFilter.GaussianBlur(radius=0.8))
+        alpha = ImageOps.invert(key_mask)
+        out = rgb_img.convert("RGBA")
+        out.putalpha(alpha)
+        return out
+
+    @staticmethod
+    def _extract_content_card_overlay(img_rgba):
+        """
+        Detect a large light-colored "content card" and make everything else transparent.
+
+        This is a robust fallback when the model ignores true alpha and/or draws a checkerboard
+        only inside a framed slide.
+        """
+        try:
+            from PIL import Image, ImageOps, ImageDraw, ImageFilter
+        except Exception:
+            return None
+
+        w, h = img_rgba.size
+        if w < 200 or h < 200:
+            return None
+
+        # Downsample for a stable bbox; use luminance to find bright regions.
+        target = (256, 256)
+        gray_small = ImageOps.grayscale(img_rgba.convert("RGB").resize(target))
+        # Threshold for "card-like" light background.
+        bin_small = gray_small.point(lambda p: 255 if p >= 220 else 0)
+        bbox = bin_small.getbbox()
+        if not bbox:
+            return None
+
+        x0, y0, x1, y1 = bbox
+        area_ratio = ((x1 - x0) * (y1 - y0)) / (target[0] * target[1])
+        if area_ratio < 0.10 or area_ratio > 0.92:
+            return None
+
+        sx = w / target[0]
+        sy = h / target[1]
+        X0 = int(x0 * sx)
+        Y0 = int(y0 * sy)
+        X1 = int(x1 * sx)
+        Y1 = int(y1 * sy)
+
+        mx = int(w * 0.02)
+        my = int(h * 0.02)
+        X0 = max(0, X0 - mx)
+        Y0 = max(0, Y0 - my)
+        X1 = min(w - 1, X1 + mx)
+        Y1 = min(h - 1, Y1 + my)
+
+        alpha = Image.new("L", (w, h), 0)
+        draw = ImageDraw.Draw(alpha)
+        radius = max(12, int(min(w, h) * 0.03))
+        draw.rounded_rectangle([X0, Y0, X1, Y1], radius=radius, fill=255)
+        alpha = alpha.filter(ImageFilter.GaussianBlur(radius=1.0))
+
+        out = img_rgba.copy()
+        out.putalpha(alpha)
+        return out
+
+    @staticmethod
     def _detect_checkerboard_background_colors(rgb_img) -> List[tuple[int, int, int]]:
         """
-        Heuristically detect 1-2 dominant light-gray background colors from image edges.
+        Heuristically detect 1-2 dominant light-gray background colors from non-central regions.
 
         Returns a list of RGB tuples, ordered by frequency.
         """
@@ -578,9 +710,13 @@ class ImageGenerator:
 
         def is_light_neutral(c: tuple[int, int, int]) -> bool:
             r, g, b = c
+            # Avoid near-white "content cards" which are often real design elements.
+            if r + g + b >= 745:
+                return False
             return (max(c) - min(c) <= 18) and (r + g + b >= 640)
 
-        # Sample edges (skip a small margin to reduce picking up UI/header elements).
+        # Sample edges + outer ring (skip center) to catch "fake transparency" checkerboards
+        # that may not touch the image boundary (e.g., inside a framed slide screenshot).
         margin = max(2, min(w, h) // 100)
         step = max(1, min(w, h) // 120)
 
@@ -591,6 +727,14 @@ class ImageGenerator:
         for y in range(margin, h - margin, step):
             samples.append(px[margin, y])
             samples.append(px[w - 1 - margin, y])
+
+        # Add a coarse grid across the whole image. We already filter to light-neutral colors,
+        # and exclude near-white, so this tends to pick up "fake transparency" checkerboards
+        # even when they appear inside a framed screenshot.
+        grid_step = max(1, min(w, h) // 80)
+        for y in range(margin, h - margin, grid_step):
+            for x in range(margin, w - margin, grid_step):
+                samples.append(px[x, y])
 
         if not samples:
             return []
@@ -603,13 +747,14 @@ class ImageGenerator:
         if not counts:
             return []
 
-        candidates = [c for c, _ in counts.most_common(6)]
+        candidates = [c for c, _ in counts.most_common(10)]
         chosen: List[tuple[int, int, int]] = []
         for c in candidates:
             if not chosen:
                 chosen.append(c)
                 continue
-            if all((abs(c[0] - p[0]) + abs(c[1] - p[1]) + abs(c[2] - p[2])) > 30 for p in chosen):
+            # Checkerboards often use two very close light grays; be less strict here.
+            if all((abs(c[0] - p[0]) + abs(c[1] - p[1]) + abs(c[2] - p[2])) > 4 for p in chosen):
                 chosen.append(c)
             if len(chosen) >= 2:
                 break

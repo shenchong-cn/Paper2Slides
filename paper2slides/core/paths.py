@@ -35,7 +35,11 @@ def get_config_name(config: Dict) -> str:
         suffix = custom[:16].replace(" ", "_").replace("/", "_") if custom else "custom"
         style = f"custom_{suffix}"
     
-    return f"{output_type}_{style}_{param}"
+    suffix = ""
+    if config.get("transparent_bg"):
+        suffix += "_tbg"
+
+    return f"{output_type}_{style}_{param}{suffix}"
 
 
 def get_config_dir(base_dir: Path, config: Dict) -> Path:
