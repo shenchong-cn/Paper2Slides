@@ -7,6 +7,7 @@ import os
 import json
 import base64
 import time
+import io
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -188,6 +189,8 @@ class ImageGenerator:
         )
         
         image_data, mime_type = self._call_model(prompt, images)
+        if transparent_bg:
+            image_data, mime_type = self._to_transparent_png(image_data, mime_type)
         return [GeneratedImage(section_id="poster", image_data=image_data, mime_type=mime_type)]
     
     def _generate_slides(self, plan, style_name, processed_style: Optional[ProcessedStyle], all_sections_md, figure_images, max_workers: int, save_callback=None, transparent_bg: bool = False) -> List[GeneratedImage]:
@@ -228,6 +231,8 @@ class ImageGenerator:
             reference_images.extend(section_images)
             
             image_data, mime_type = self._call_model(prompt, reference_images)
+            if transparent_bg:
+                image_data, mime_type = self._to_transparent_png(image_data, mime_type)
             
             # Save 2nd slide (i=1) as style reference
             if i == 1:
@@ -268,6 +273,8 @@ class ImageGenerator:
                 reference_images.extend(section_images)
                 
                 image_data, mime_type = self._call_model(prompt, reference_images)
+                if transparent_bg:
+                    image_data, mime_type = self._to_transparent_png(image_data, mime_type)
                 return i, GeneratedImage(section_id=section.id, image_data=image_data, mime_type=mime_type)
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -324,7 +331,11 @@ class ImageGenerator:
 
         # Add transparent background instruction if requested
         if transparent_bg:
-            parts.append("IMPORTANT: Generate with TRANSPARENT background. No background color, only transparent. All text and elements should be clearly visible on transparent background.")
+            parts.append(
+                "IMPORTANT: Output a PNG with a TRUE transparent background (alpha channel). "
+                "Do NOT draw any checkerboard/grid pattern to represent transparency. "
+                "Background pixels must have alpha=0; only the content (text/figures/shapes) should be opaque."
+            )
 
         if style_name == "custom" and processed_style:
             parts.append(f"Style: {self._format_custom_style_for_poster(processed_style)}")
@@ -345,7 +356,11 @@ class ImageGenerator:
 
         # Add transparent background instruction if requested
         if transparent_bg:
-            parts.append("IMPORTANT: Generate with TRANSPARENT background. No background color, only transparent. All text and elements should be clearly visible on transparent background.")
+            parts.append(
+                "IMPORTANT: Output a PNG with a TRUE transparent background (alpha channel). "
+                "Do NOT draw any checkerboard/grid pattern to represent transparency. "
+                "Background pixels must have alpha=0; only the content (text/figures/shapes) should be opaque."
+            )
 
         if style_name == "custom" and processed_style:
             parts.append(f"Style: {self._format_custom_style_for_slide(processed_style)}")
@@ -443,6 +458,138 @@ class ImageGenerator:
         if self.provider == "google":
             return self._call_model_google(prompt, reference_images)
         return self._call_model_openrouter(prompt, reference_images)
+
+    def _to_transparent_png(self, image_data: bytes, mime_type: str) -> tuple[bytes, str]:
+        """
+        Ensure the output is a PNG that actually uses transparency.
+
+        Some image models "fake" transparency by drawing a checkerboard background into RGB,
+        or return formats without alpha (e.g., JPEG). When `transparent_bg` is requested we
+        convert to RGBA PNG and attempt to key out a checkerboard-like background.
+        """
+        try:
+            from PIL import Image  # type: ignore
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Pillow not available; cannot post-process transparency. Returning original image bytes."
+            )
+            return image_data, mime_type
+
+        logger = logging.getLogger(__name__)
+        try:
+            img = Image.open(io.BytesIO(image_data))
+            img.load()
+        except Exception as e:
+            logger.warning(f"Failed to decode generated image for transparency post-process: {e}")
+            return image_data, mime_type
+
+        img_rgba = img.convert("RGBA")
+        alpha = img_rgba.getchannel("A")
+        a_min, a_max = alpha.getextrema()
+
+        # Already has real transparency; just normalize to PNG.
+        if a_min < 255:
+            buf = io.BytesIO()
+            img_rgba.save(buf, format="PNG")
+            return buf.getvalue(), "image/png"
+
+        # No transparency at all; attempt to remove a fake checkerboard background.
+        rgb = img_rgba.convert("RGB")
+        bg_colors = self._detect_checkerboard_background_colors(rgb)
+        if not bg_colors:
+            buf = io.BytesIO()
+            img_rgba.save(buf, format="PNG")
+            return buf.getvalue(), "image/png"
+
+        bg1 = bg_colors[0]
+        bg2 = bg_colors[1] if len(bg_colors) > 1 else bg_colors[0]
+        w, h = rgb.size
+        rgb_bytes = rgb.tobytes()
+
+        # Soft keying to reduce halos on anti-aliased edges.
+        t0 = 6   # fully transparent threshold
+        t1 = 80  # fully opaque threshold
+
+        out = bytearray(w * h * 4)
+        oi = 0
+        for i in range(0, len(rgb_bytes), 3):
+            r = rgb_bytes[i]
+            g = rgb_bytes[i + 1]
+            b = rgb_bytes[i + 2]
+
+            d1 = abs(r - bg1[0]) + abs(g - bg1[1]) + abs(b - bg1[2])
+            d2 = abs(r - bg2[0]) + abs(g - bg2[1]) + abs(b - bg2[2])
+            d = d1 if d1 < d2 else d2
+
+            if d <= t0:
+                a = 0
+            elif d >= t1:
+                a = 255
+            else:
+                a = int((d - t0) * 255 / (t1 - t0))
+
+            out[oi] = r
+            out[oi + 1] = g
+            out[oi + 2] = b
+            out[oi + 3] = a
+            oi += 4
+
+        keyed = Image.frombytes("RGBA", (w, h), bytes(out))
+        buf = io.BytesIO()
+        keyed.save(buf, format="PNG")
+        return buf.getvalue(), "image/png"
+
+    @staticmethod
+    def _detect_checkerboard_background_colors(rgb_img) -> List[tuple[int, int, int]]:
+        """
+        Heuristically detect 1-2 dominant light-gray background colors from image edges.
+
+        Returns a list of RGB tuples, ordered by frequency.
+        """
+        from collections import Counter
+
+        w, h = rgb_img.size
+        px = rgb_img.load()
+
+        def is_light_neutral(c: tuple[int, int, int]) -> bool:
+            r, g, b = c
+            return (max(c) - min(c) <= 18) and (r + g + b >= 640)
+
+        # Sample edges (skip a small margin to reduce picking up UI/header elements).
+        margin = max(2, min(w, h) // 100)
+        step = max(1, min(w, h) // 120)
+
+        samples = []
+        for x in range(margin, w - margin, step):
+            samples.append(px[x, margin])
+            samples.append(px[x, h - 1 - margin])
+        for y in range(margin, h - margin, step):
+            samples.append(px[margin, y])
+            samples.append(px[w - 1 - margin, y])
+
+        if not samples:
+            return []
+
+        # Quantize a bit so near-equal colors cluster.
+        def q(c: tuple[int, int, int]) -> tuple[int, int, int]:
+            return (c[0] & 0xF8, c[1] & 0xF8, c[2] & 0xF8)
+
+        counts = Counter(q(c) for c in samples if is_light_neutral(c))
+        if not counts:
+            return []
+
+        candidates = [c for c, _ in counts.most_common(6)]
+        chosen: List[tuple[int, int, int]] = []
+        for c in candidates:
+            if not chosen:
+                chosen.append(c)
+                continue
+            if all((abs(c[0] - p[0]) + abs(c[1] - p[1]) + abs(c[2] - p[2])) > 30 for p in chosen):
+                chosen.append(c)
+            if len(chosen) >= 2:
+                break
+
+        return chosen
     
     def _call_model_openrouter(self, prompt: str, reference_images: List[dict]) -> tuple:
         """Call the image generation model with retry logic."""
