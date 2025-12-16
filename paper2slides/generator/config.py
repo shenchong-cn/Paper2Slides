@@ -66,6 +66,9 @@ class GenerationConfig:
     # Style
     style: StyleType = StyleType.ACADEMIC
     custom_style: Optional[str] = None
+
+    # Generation options
+    transparent_bg: bool = False
     
     def get_page_range(self) -> tuple[int, int]:
         """Get page count range for slides."""

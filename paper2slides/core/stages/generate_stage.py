@@ -83,11 +83,21 @@ async def run_generate_stage(base_dir: Path, config_dir: Path, config: Dict) -> 
     # Prepare output directory
     output_subdir = get_output_dir(config_dir)
     output_subdir.mkdir(parents=True, exist_ok=True)
-    ext_map = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
-    
+
+    # Force PNG format for transparent background
+    transparent_bg = config.get("transparent_bg", False)
+    if transparent_bg:
+        ext_map = {"image/png": ".png"}  # Only PNG for transparency
+    else:
+        ext_map = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+
     # Save callback: save each image immediately after generation
     def save_image_callback(img, index, total):
-        ext = ext_map.get(img.mime_type, ".png")
+        # Force PNG extension for transparent background
+        if transparent_bg:
+            ext = ".png"
+        else:
+            ext = ext_map.get(img.mime_type, ".png")
         filepath = output_subdir / f"{img.section_id}{ext}"
         with open(filepath, "wb") as f:
             f.write(img.image_data)

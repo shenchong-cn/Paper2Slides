@@ -157,6 +157,7 @@ class ImageGenerator:
         figure_images = self._load_figure_images(plan, gen_input.origin.base_path)
         style_name = gen_input.config.style.value
         custom_style = gen_input.config.custom_style
+        transparent_bg = gen_input.config.transparent_bg
         
         # Process custom style with LLM if needed
         processed_style = None
@@ -169,26 +170,27 @@ class ImageGenerator:
         all_images = self._filter_images(plan.sections, figure_images)
         
         if plan.output_type == "poster":
-            result = self._generate_poster(style_name, processed_style, all_sections_md, all_images)
+            result = self._generate_poster(style_name, processed_style, all_sections_md, all_images, transparent_bg)
             if save_callback and result:
                 save_callback(result[0], 0, 1)
             return result
         else:
-            return self._generate_slides(plan, style_name, processed_style, all_sections_md, figure_images, max_workers, save_callback)
+            return self._generate_slides(plan, style_name, processed_style, all_sections_md, figure_images, max_workers, save_callback, transparent_bg)
     
-    def _generate_poster(self, style_name, processed_style: Optional[ProcessedStyle], sections_md, images) -> List[GeneratedImage]:
+    def _generate_poster(self, style_name, processed_style: Optional[ProcessedStyle], sections_md, images, transparent_bg: bool = False) -> List[GeneratedImage]:
         """Generate 1 poster image."""
         prompt = self._build_poster_prompt(
             format_prefix=FORMAT_POSTER,
             style_name=style_name,
             processed_style=processed_style,
             sections_md=sections_md,
+            transparent_bg=transparent_bg,
         )
         
         image_data, mime_type = self._call_model(prompt, images)
         return [GeneratedImage(section_id="poster", image_data=image_data, mime_type=mime_type)]
     
-    def _generate_slides(self, plan, style_name, processed_style: Optional[ProcessedStyle], all_sections_md, figure_images, max_workers: int, save_callback=None) -> List[GeneratedImage]:
+    def _generate_slides(self, plan, style_name, processed_style: Optional[ProcessedStyle], all_sections_md, figure_images, max_workers: int, save_callback=None, transparent_bg: bool = False) -> List[GeneratedImage]:
         """Generate N slide images (slides 1-2 sequential, 3+ parallel)."""
         results = []
         total = len(plan.sections)
@@ -216,6 +218,7 @@ class ImageGenerator:
                 layout_rule=layout_rule,
                 slide_info=f"Slide {i+1} of {total}",
                 context_md=all_sections_md,
+                transparent_bg=transparent_bg,
             )
             
             section_images = self._filter_images([section], figure_images)
@@ -257,6 +260,7 @@ class ImageGenerator:
                     layout_rule=layout_rule,
                     slide_info=f"Slide {i+1} of {total}",
                     context_md=all_sections_md,
+                    transparent_bg=transparent_bg,
                 )
                 
                 section_images = self._filter_images([section], figure_images)
@@ -314,27 +318,35 @@ class ImageGenerator:
             parts.append(ps.special_elements + ".")
         return " ".join(parts)
     
-    def _build_poster_prompt(self, format_prefix, style_name, processed_style: Optional[ProcessedStyle], sections_md) -> str:
+    def _build_poster_prompt(self, format_prefix, style_name, processed_style: Optional[ProcessedStyle], sections_md, transparent_bg: bool = False) -> str:
         """Build prompt for poster."""
         parts = [format_prefix]
-        
+
+        # Add transparent background instruction if requested
+        if transparent_bg:
+            parts.append("IMPORTANT: Generate with TRANSPARENT background. No background color, only transparent. All text and elements should be clearly visible on transparent background.")
+
         if style_name == "custom" and processed_style:
             parts.append(f"Style: {self._format_custom_style_for_poster(processed_style)}")
             if processed_style.decorations:
                 parts.append(f"Decorations: {processed_style.decorations}")
         else:
             parts.append(POSTER_STYLE_HINTS.get(style_name, POSTER_STYLE_HINTS["academic"]))
-        
+
         parts.append(VISUALIZATION_HINTS)
         parts.append(POSTER_FIGURE_HINT)
         parts.append(f"---\nContent:\n{sections_md}")
         
         return "\n\n".join(parts)
     
-    def _build_slide_prompt(self, style_name, processed_style: Optional[ProcessedStyle], sections_md, layout_rule, slide_info, context_md) -> str:
+    def _build_slide_prompt(self, style_name, processed_style: Optional[ProcessedStyle], sections_md, layout_rule, slide_info, context_md, transparent_bg: bool = False) -> str:
         """Build prompt for slide with layout rules and consistency."""
         parts = [FORMAT_SLIDE]
-        
+
+        # Add transparent background instruction if requested
+        if transparent_bg:
+            parts.append("IMPORTANT: Generate with TRANSPARENT background. No background color, only transparent. All text and elements should be clearly visible on transparent background.")
+
         if style_name == "custom" and processed_style:
             parts.append(f"Style: {self._format_custom_style_for_slide(processed_style)}")
         else:

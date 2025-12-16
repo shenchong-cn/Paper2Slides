@@ -62,6 +62,8 @@ def main():
                         help="Fast mode: parse only, no RAG indexing (direct LLM query)")
     parser.add_argument("--parallel", type=int, nargs='?', const=2, default=None,
                         help="Enable parallel slide generation with N workers (default: 2 if specified)")
+    parser.add_argument("--transparent-bg", action="store_true",
+                        help="Generate images with transparent background (PNG format)")
     
     args = parser.parse_args()
     
@@ -100,6 +102,7 @@ def main():
         "poster_density": args.density,
         "fast_mode": args.fast,
         "max_workers": args.parallel if args.parallel else 1,
+        "transparent_bg": args.transparent_bg,
     }
     
     # Determine paths
