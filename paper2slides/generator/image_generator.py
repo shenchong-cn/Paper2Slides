@@ -145,16 +145,19 @@ class ImageGenerator:
     ) -> List[GeneratedImage]:
         """
         Generate images from ContentPlan.
-        
+
         Args:
             plan: ContentPlan from ContentPlanner
             gen_input: GenerationInput with config and origin
             max_workers: Maximum parallel workers for slides (3rd+ slides run in parallel)
             save_callback: Optional callback function(generated_image, index, total) called after each image
-        
+
         Returns:
             List of GeneratedImage (1 for poster, N for slides)
         """
+        # Save config for use in transparency processing
+        self.config = gen_input.config
+
         figure_images = self._load_figure_images(plan, gen_input.origin.base_path)
         style_name = gen_input.config.style.value
         custom_style = gen_input.config.custom_style
@@ -332,16 +335,17 @@ class ImageGenerator:
         # Add transparent background instruction if requested
         if transparent_bg:
             parts.append(
-                "IMPORTANT: Output a PNG with a TRUE transparent background (alpha channel). "
-                "Do NOT draw any checkerboard/grid pattern to represent transparency. "
-                "Background pixels must have alpha=0; only the content (text/figures/shapes) should be opaque. "
-                "For readability on arbitrary slide templates, place all content on a centered rounded-rectangle "
-                "content card (e.g., white at ~90–95% opacity) and keep margins outside the card fully transparent."
-            )
-            parts.append(
-                "IMPLEMENTATION HINT: Set the entire canvas background to a pure chroma-key color #FF00FF (magenta) "
-                "and NEVER use #FF00FF anywhere else in the design. Do not use gradients/textures on the background. "
-                "This background will be programmatically converted to transparency."
+                "CRITICAL REQUIREMENT - True Transparent Background:\n"
+                "1. OUTPUT FORMAT: PNG with alpha channel (RGBA). Prefer true transparent background (alpha=0) "
+                "for ALL background areas. If true alpha cannot be reliably produced, use a single flat chroma-key "
+                "background color #FF00FF (magenta). NEVER use #FF00FF in content. NO large solid background panels/cards.\n"
+                "2. CONTENT RENDERING: Render ONLY actual content (text/charts/diagrams/icons) directly on transparent "
+                "canvas (or on #FF00FF if needed). Avoid large filled rectangles behind content. Text must remain legible "
+                "on various PPT templates by using outlines/strokes and/or shadows. Charts should use vibrant colors.\n"
+                "3. READABILITY: Use text with outlines/strokes (e.g., white text with dark outline, or dark text with "
+                "light outline). Use subtle shadows. Prefer medium-to-bold fonts and high-contrast colors.\n"
+                "4. AVOID: NO white/light content card, NO rounded rectangle panel, NO background gradients/textures, "
+                "NO checkerboard pattern, NO pure white text without outline/shadow."
             )
 
         if style_name == "custom" and processed_style:
@@ -364,16 +368,17 @@ class ImageGenerator:
         # Add transparent background instruction if requested
         if transparent_bg:
             parts.append(
-                "IMPORTANT: Output a PNG with a TRUE transparent background (alpha channel). "
-                "Do NOT draw any checkerboard/grid pattern to represent transparency. "
-                "Background pixels must have alpha=0; only the content (text/figures/shapes) should be opaque. "
-                "For readability on arbitrary slide templates, place all content on a centered rounded-rectangle "
-                "content card (e.g., white at ~90–95% opacity) and keep margins outside the card fully transparent."
-            )
-            parts.append(
-                "IMPLEMENTATION HINT: Set the entire canvas background to a pure chroma-key color #FF00FF (magenta) "
-                "and NEVER use #FF00FF anywhere else in the design. Do not use gradients/textures on the background. "
-                "This background will be programmatically converted to transparency."
+                "CRITICAL REQUIREMENT - True Transparent Background:\n"
+                "1. OUTPUT FORMAT: PNG with alpha channel (RGBA). Prefer true transparent background (alpha=0) "
+                "for ALL background areas. If true alpha cannot be reliably produced, use a single flat chroma-key "
+                "background color #FF00FF (magenta). NEVER use #FF00FF in content. NO large solid background panels/cards.\n"
+                "2. CONTENT RENDERING: Render ONLY actual content (text/charts/diagrams/icons) directly on transparent "
+                "canvas (or on #FF00FF if needed). Avoid large filled rectangles behind content. Text must remain legible "
+                "on various PPT templates by using outlines/strokes and/or shadows. Charts should use vibrant colors.\n"
+                "3. READABILITY: Use text with outlines/strokes (e.g., white text with dark outline, or dark text with "
+                "light outline). Use subtle shadows. Prefer medium-to-bold fonts and high-contrast colors.\n"
+                "4. AVOID: NO white/light content card, NO rounded rectangle panel, NO background gradients/textures, "
+                "NO checkerboard pattern, NO pure white text without outline/shadow."
             )
 
         if style_name == "custom" and processed_style:
@@ -518,7 +523,10 @@ class ImageGenerator:
         if a_min < 255:
             buf = io.BytesIO()
             img_rgba.save(buf, format="PNG")
-            return buf.getvalue(), "image/png"
+            result_data = buf.getvalue()
+            logger.info("Image already has real transparency (alpha channel detected)")
+            self._log_transparency_quality(result_data)
+            return result_data, "image/png"
 
         # No transparency at all; try chroma-key first (if the model followed instructions).
         rgb = img_rgba.convert("RGB")
@@ -526,7 +534,10 @@ class ImageGenerator:
         if keyed is not None:
             buf = io.BytesIO()
             keyed.save(buf, format="PNG")
-            return buf.getvalue(), "image/png"
+            result_data = buf.getvalue()
+            logger.info("Applied chroma-key transparency (magenta #FF00FF detected)")
+            self._log_transparency_quality(result_data)
+            return result_data, "image/png"
 
         # Attempt to remove a fake checkerboard background (common "fake transparency").
         bg_colors = self._detect_checkerboard_background_colors(rgb)
@@ -536,17 +547,31 @@ class ImageGenerator:
             if card_overlay is not None:
                 buf = io.BytesIO()
                 card_overlay.save(buf, format="PNG")
-                return buf.getvalue(), "image/png"
+                result_data = buf.getvalue()
+                logger.info("Applied content card extraction")
+                self._log_transparency_quality(result_data)
+                return result_data, "image/png"
+
+            # Final fallback: if cleanup_light_panel is enabled, try to remove light panel background
+            if hasattr(self, 'config') and self.config.cleanup_light_panel:
+                logger.info("Attempting light panel background removal as final fallback")
+                result_data, result_mime = self._remove_light_panel_background(image_data, mime_type)
+                self._log_transparency_quality(result_data)
+                return result_data, result_mime
 
             buf = io.BytesIO()
             img_rgba.save(buf, format="PNG")
-            return buf.getvalue(), "image/png"
+            result_data = buf.getvalue()
+            logger.warning("No transparency processing applied (no alpha/chroma-key/checkerboard detected)")
+            return result_data, "image/png"
 
         # Require 2 distinct colors; otherwise it may just be a real solid background or card panel.
         if len(bg_colors) < 2:
             buf = io.BytesIO()
             img_rgba.save(buf, format="PNG")
-            return buf.getvalue(), "image/png"
+            result_data = buf.getvalue()
+            logger.warning("Checkerboard detection failed (insufficient distinct colors)")
+            return result_data, "image/png"
 
         bg1, bg2 = bg_colors[0], bg_colors[1]
         w, h = rgb.size
@@ -586,7 +611,111 @@ class ImageGenerator:
         keyed = Image.frombytes("RGBA", (w, h), bytes(out))
         buf = io.BytesIO()
         keyed.save(buf, format="PNG")
-        return buf.getvalue(), "image/png"
+        result_data = buf.getvalue()
+        logger.info("Applied checkerboard background removal")
+        self._log_transparency_quality(result_data)
+        return result_data, "image/png"
+
+    def _log_transparency_quality(self, image_data: bytes):
+        """Log transparency quality assessment if enabled."""
+        if not hasattr(self, 'config') or not self.config.transparent_bg:
+            return
+
+        logger = logging.getLogger(__name__)
+        quality = assess_transparency_quality_v2(image_data)
+        logger.info(f"Transparency quality: score={quality.score:.1f}, "
+                   f"light_panel={quality.has_large_light_panel}, "
+                   f"edge={quality.edge_quality}")
+        if quality.warnings:
+            for warning in quality.warnings:
+                logger.warning(f"Transparency: {warning}")
+
+    def _remove_light_panel_background(self, image_data: bytes, mime_type: str) -> tuple[bytes, str]:
+        """
+        在检测到"浅色内容卡片/面板"时，尝试移除面板背景，保留内容。
+
+        重要约束：
+        - 仅作为兜底：当真 alpha / 色键 / 棋盘格检测都失败时启用
+        - 不保证保留"白色内容贴在白色面板上"这种本身不可读的情况
+        - 优先避免误删：宁可残留少量面板，也不应大量丢失内容
+        """
+        try:
+            from PIL import Image, ImageOps, ImageFilter, ImageChops, ImageDraw, ImageStat
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Pillow not available; cannot process light panel removal."
+            )
+            return image_data, mime_type
+
+        logger = logging.getLogger(__name__)
+        try:
+            img = Image.open(io.BytesIO(image_data)).convert("RGBA")
+            w, h = img.size
+
+            # 1) 先检测是否存在"面板/卡片"区域（下采样 + 亮度阈值）
+            gray_small = ImageOps.grayscale(img.convert("RGB").resize((256, 256)))
+            panel_luma = self.config.panel_detect_luma if hasattr(self, 'config') else 220
+            bin_small = gray_small.point(lambda p: 255 if p >= panel_luma else 0)
+            bbox = bin_small.getbbox()
+
+            if not bbox:
+                # 未检测到面板，直接返回
+                return image_data, mime_type
+
+            # 2) 将 bbox 映射回原图坐标
+            x0, y0, x1, y1 = bbox
+            sx, sy = w / 256.0, h / 256.0
+            X0, Y0, X1, Y1 = int(x0 * sx), int(y0 * sy), int(x1 * sx), int(y1 * sy)
+
+            # 面板太小，不处理
+            if X1 - X0 < w * 0.2 or Y1 - Y0 < h * 0.2:
+                return image_data, mime_type
+
+            panel = img.crop((X0, Y0, X1, Y1))
+            panel_rgb = panel.convert("RGB")
+
+            # 3) 估计面板背景色：取面板边框区域的均值色
+            bw, bh = panel.size
+            border = Image.new("L", (bw, bh), 0)
+            draw = ImageDraw.Draw(border)
+            t = max(2, min(bw, bh) // 40)  # border thickness
+            draw.rectangle([0, 0, bw - 1, bh - 1], outline=255, width=t)
+            stat = ImageStat.Stat(panel_rgb, mask=border)
+            bg = tuple(int(v) for v in stat.mean)
+
+            # 4) 以"与背景色的差异"判定内容
+            diff = ImageChops.difference(panel_rgb, Image.new("RGB", (bw, bh), bg))
+            diff_gray = ImageOps.grayscale(diff)
+            content_diff_threshold = self.config.content_diff_threshold if hasattr(self, 'config') else 25
+            content = diff_gray.point(lambda p: 255 if p >= content_diff_threshold else 0)
+
+            # 5) 边缘处理：轻微膨胀包含抗锯齿边缘
+            edge_expand = self.config.edge_expand if hasattr(self, 'config') else 2
+            content = content.filter(ImageFilter.MaxFilter(edge_expand * 2 + 1))
+
+            # 可选轻微平滑
+            edge_blur = self.config.edge_blur if hasattr(self, 'config') else 0.8
+            if edge_blur > 0:
+                content = content.filter(ImageFilter.GaussianBlur(radius=edge_blur))
+
+            # 6) 将面板内非内容设为透明（用 content 掩码作为 alpha）
+            out = img.copy()
+            out_alpha = out.getchannel("A")
+            out_alpha.paste(content, (X0, Y0))
+            out.putalpha(out_alpha)
+
+            buf = io.BytesIO()
+            out.save(buf, format="PNG")
+            logger.info("Light panel background removed successfully")
+            return buf.getvalue(), "image/png"
+
+        except Exception as e:
+            logger.warning(f"Failed to remove light panel background: {e}")
+            # 如果启用了回滚机制，返回原图
+            if hasattr(self, 'config') and self.config.fallback_to_old_behavior:
+                return image_data, mime_type
+            # 否则尝试返回处理后的结果（可能部分成功）
+            return image_data, mime_type
 
     @staticmethod
     def _key_out_chroma(rgb_img, key_rgb: tuple[int, int, int], tol: int = 18):
@@ -948,31 +1077,125 @@ class ImageGenerator:
         raise RuntimeError("Image generation failed after all retry attempts")
 
 
+@dataclass
+class TransparencyQuality:
+    """透明度质量评估结果"""
+    score: float  # 0-100分
+    has_large_light_panel: bool  # 是否存在大面积浅色面板残留
+    light_panel_ratio: float  # 不透明区域中"浅色低饱和"比例（诊断项）
+    edge_quality: str  # "smooth" | "jagged"（诊断项）
+    warnings: List[str]
+
+
+def assess_transparency_quality_v2(img_data: bytes) -> TransparencyQuality:
+    """
+    评估透明度质量（不依赖 numpy）
+
+    Args:
+        img_data: PNG图像数据（bytes）
+
+    Returns:
+        TransparencyQuality: 质量评估结果
+    """
+    try:
+        from PIL import Image
+        import io
+
+        img = Image.open(io.BytesIO(img_data)).convert("RGBA")
+
+        # 下采样做诊断，避免全分辨率遍历过慢
+        img = img.resize((256, 256))
+        alpha_data = list(img.getchannel("A").getdata())
+        rgb_data = list(img.convert("RGB").getdata())
+
+        # 检查是否还有"大面积浅色面板/背景"
+        opaque_idx = [i for i, a in enumerate(alpha_data) if a > 200]
+
+        if opaque_idx:
+            light_neutral = 0
+            for i in opaque_idx:
+                r, g, b = rgb_data[i]
+                # 浅色：RGB总和>660，低饱和：最大最小差<30
+                if (r + g + b > 660) and (max(r, g, b) - min(r, g, b) < 30):
+                    light_neutral += 1
+            light_panel_ratio = light_neutral / len(opaque_idx)
+            has_large_light_panel = light_panel_ratio > 0.30
+        else:
+            light_panel_ratio = 0.0
+            has_large_light_panel = False
+
+        # 评分
+        score = 0
+        score += 60 if not has_large_light_panel else 25
+
+        # 边缘质量
+        semi_transparent = sum(1 for a in alpha_data if 10 < a < 245)
+        semi_ratio = semi_transparent / len(alpha_data)
+        if semi_ratio > 0.02:
+            score += 20
+            edge_quality = "smooth"
+        else:
+            score += 5
+            edge_quality = "jagged"
+
+        # 透明度覆盖（额外加分）
+        transparent = sum(1 for a in alpha_data if a < 10)
+        trans_ratio = transparent / len(alpha_data)
+        if trans_ratio > 0.20:
+            score += 20
+        elif trans_ratio > 0.10:
+            score += 10
+
+        warnings = []
+        if has_large_light_panel:
+            warnings.append("Large light panel/background remains (may look like a white rectangle in PPT)")
+        if edge_quality == "jagged":
+            warnings.append("Edges may appear jagged (consider adjusting edge_blur parameter)")
+
+        return TransparencyQuality(
+            score=min(100, score),  # 限制最高100分
+            has_large_light_panel=has_large_light_panel,
+            light_panel_ratio=light_panel_ratio,
+            edge_quality=edge_quality,
+            warnings=warnings
+        )
+
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Failed to assess transparency quality: {e}")
+        return TransparencyQuality(
+            score=0,
+            has_large_light_panel=False,
+            light_panel_ratio=0.0,
+            edge_quality="unknown",
+            warnings=[f"Assessment failed: {str(e)}"]
+        )
+
+
 def save_images_as_pdf(images: List[GeneratedImage], output_path: str):
     """
     Save generated images as a single PDF file.
-    
+
     Args:
         images: List of GeneratedImage from ImageGenerator.generate()
         output_path: Output PDF file path
     """
     from PIL import Image
     import io
-    
+
     pdf_images = []
-    
+
     for img in images:
         # Load image from bytes
         pil_img = Image.open(io.BytesIO(img.image_data))
-        
+
         # Convert RGBA to RGB (PDF doesn't support alpha)
         if pil_img.mode == 'RGBA':
             pil_img = pil_img.convert('RGB')
         elif pil_img.mode != 'RGB':
             pil_img = pil_img.convert('RGB')
-        
+
         pdf_images.append(pil_img)
-    
+
     if pdf_images:
         # Save first image and append the rest
         pdf_images[0].save(

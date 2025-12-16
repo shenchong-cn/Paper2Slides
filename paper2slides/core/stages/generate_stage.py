@@ -76,6 +76,14 @@ async def run_generate_stage(base_dir: Path, config_dir: Path, config: Dict) -> 
         style=StyleType(config.get("style", "academic")),
         custom_style=config.get("custom_style"),
         transparent_bg=config.get("transparent_bg", False),
+        # Transparent background advanced options
+        cleanup_light_panel=config.get("cleanup_light_panel", True),
+        panel_detect_luma=config.get("panel_detect_luma", 220),
+        content_diff_threshold=config.get("content_diff_threshold", 25),
+        edge_expand=config.get("edge_expand", 2),
+        edge_blur=config.get("edge_blur", 0.8),
+        debug_save_intermediate=config.get("debug_save_intermediate", False),
+        fallback_to_old_behavior=config.get("fallback_to_old_behavior", False),
     )
     gen_input = GenerationInput(config=gen_config, content=content, origin=origin)
     

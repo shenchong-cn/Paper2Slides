@@ -69,7 +69,16 @@ class GenerationConfig:
 
     # Generation options
     transparent_bg: bool = False
-    
+
+    # Transparent background advanced options
+    cleanup_light_panel: bool = True  # 是否启用"浅色面板去除"兜底
+    panel_detect_luma: int = 220  # 面板检测亮度阈值
+    content_diff_threshold: int = 25  # 与面板背景色差阈值
+    edge_expand: int = 2  # 内容掩码膨胀像素
+    edge_blur: float = 0.8  # 边缘平滑半径
+    debug_save_intermediate: bool = False  # 保存中间结果用于调试
+    fallback_to_old_behavior: bool = False  # 出错时回退到旧行为
+
     def get_page_range(self) -> tuple[int, int]:
         """Get page count range for slides."""
         return SLIDES_PAGE_RANGES.get(self.slides_length.value, (8, 12))

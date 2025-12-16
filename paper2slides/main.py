@@ -64,7 +64,23 @@ def main():
                         help="Enable parallel slide generation with N workers (default: 2 if specified)")
     parser.add_argument("--transparent-bg", action="store_true",
                         help="Generate images with transparent background (PNG format)")
-    
+
+    # Transparent background advanced options
+    parser.add_argument("--keep-light-panel", action="store_true",
+                        help="Keep light panel (disable cleanup fallback)")
+    parser.add_argument("--panel-luma", type=int, default=220,
+                        help="Panel detection luminance threshold (default: 220)")
+    parser.add_argument("--content-diff", type=int, default=25,
+                        help="Content/background color difference threshold (default: 25)")
+    parser.add_argument("--edge-expand", type=int, default=2,
+                        help="Content mask dilation pixels (default: 2)")
+    parser.add_argument("--edge-blur", type=float, default=0.8,
+                        help="Edge smoothing radius (default: 0.8)")
+    parser.add_argument("--debug-transparency", action="store_true",
+                        help="Save intermediate results for debugging")
+    parser.add_argument("--fallback-on-error", action="store_true",
+                        help="Fallback to old behavior on error")
+
     args = parser.parse_args()
     
     # Setup logging
@@ -103,6 +119,14 @@ def main():
         "fast_mode": args.fast,
         "max_workers": args.parallel if args.parallel else 1,
         "transparent_bg": args.transparent_bg,
+        # Transparent background advanced options
+        "cleanup_light_panel": not args.keep_light_panel,
+        "panel_detect_luma": args.panel_luma,
+        "content_diff_threshold": args.content_diff,
+        "edge_expand": args.edge_expand,
+        "edge_blur": args.edge_blur,
+        "debug_save_intermediate": args.debug_transparency,
+        "fallback_to_old_behavior": args.fallback_on_error,
     }
     
     # Determine paths
