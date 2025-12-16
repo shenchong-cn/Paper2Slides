@@ -2,9 +2,23 @@
 
 ## 文档信息
 - **创建日期**: 2025-12-16
-- **版本**: v2.0 (重大修订)
+- **版本**: v2.1 (评审修订：统一提示词与兜底策略、移除 numpy 强依赖)
 - **作者**: Claude Code
 - **相关Issue**: 透明背景PNG效果不佳 - 白色背景不透明
+
+## 0. 目标与范围
+
+### 0.1 目标（面向用户体验）
+
+当用户启用 `--transparent-bg` 生成 PNG 并插入 PPT 时：
+- PNG 的“背景区域”应为真正透明（alpha=0），不出现白色矩形/面板
+- 只显示内容元素（文字/图表/图形/图标），像“浮在 PPT 模板上”
+- 不要求对所有 PPT 背景都 100% 可读，但应通过描边/阴影/配色让大多数背景可读
+
+### 0.2 非目标（本次不做）
+
+- 不引入深度学习分割模型（如 U-Net）做前景分割
+- 不追求对“白色文字 + 白色面板”这类本身不可读的内容进行“无中生有式”修复
 
 ## 1. 问题分析
 
@@ -68,6 +82,10 @@
 - ✓ 内容直接浮在PPT背景上
 - ✓ 没有白色卡片背景
 
+**实现侧的放大因素（现有代码行为）**：
+- 透明背景流程当前同时“提示模型使用 #FF00FF 纯色背景做色键”并“提示生成白色 content card”，目标互相矛盾：色键需要整幅背景统一、面板需要大面积不透明浅色区域。
+- 后处理 `_to_transparent_png` 在“识别不到色键/棋盘格”时，会回退到 `_extract_content_card_overlay`：把“卡片外部”设为透明、保留整张卡片（这会在 PPT 中表现为白色矩形），与用户期望相反。
+
 ### 1.4 对比分析
 
 | 项目 | 当前效果 | 用户期望 |
@@ -84,7 +102,9 @@
 
 采用**两阶段策略**：
 1. **阶段1**: 修改提示词，要求模型生成无背景的内容
-2. **阶段2**: 后处理去除白色/浅色背景，只保留实际内容
+2. **阶段2**: 后处理在必要时去除“浅色面板/内容卡片”，只保留实际内容（兜底）
+
+> 设计原则：尽量让模型“直接生成可用透明背景”，后处理只做保守兜底；避免把后处理变成“无监督抠图器”导致误删内容。
 
 ### 2.2 阶段1: 提示词优化
 
@@ -98,7 +118,7 @@
 
 这个提示词**明确要求**生成白色卡片，导致问题。
 
-#### 新提示词设计
+#### 新提示词设计（兼容色键兜底，不再要求 content card）
 
 ```python
 TRANSPARENT_BG_PROMPT_V2 = """
@@ -106,144 +126,146 @@ CRITICAL REQUIREMENT - True Transparent Background:
 
 1. OUTPUT FORMAT:
    - PNG with alpha channel (RGBA)
-   - Transparent background (alpha=0) for ALL background areas
-   - NO solid color background, NO white card, NO colored panel
+   - Prefer a true transparent background (alpha=0) for ALL background areas
+   - If true alpha cannot be reliably produced, use a single flat chroma-key background color #FF00FF (magenta)
+   - NEVER use #FF00FF anywhere in content (text/shapes/charts/icons)
+   - NO large solid background panels/cards (no white card, no rounded rectangle panel, no page-like backdrop)
 
 2. CONTENT RENDERING:
    - Render ONLY the actual content: text, charts, diagrams, icons
-   - Text should have solid colors with high contrast (dark text for light backgrounds, light text for dark backgrounds)
+   - All content should be directly rendered on a transparent canvas (or on #FF00FF only if needed for chroma-key)
+   - Avoid large filled rectangles behind content
+   - Text must remain legible on various PPT templates by using outlines/strokes and/or shadows
    - Charts and diagrams should use vibrant colors
-   - All content should be directly rendered on transparent background
 
 3. READABILITY STRATEGY:
    Since the background is transparent and will be placed on various PPT templates:
-   - Use text with outlines/strokes for better visibility (e.g., white text with dark outline, or dark text with light outline)
-   - OR use semi-transparent text shadows for depth
-   - OR use bold fonts with high-contrast colors
+   - Use text with outlines/strokes for visibility (e.g., white text with dark outline, or dark text with light outline)
+   - Use subtle shadows (not large glows) to separate content from background
+   - Prefer medium-to-bold fonts and high-contrast colors
    - Charts and diagrams should have clear borders and fills
 
 4. WHAT TO AVOID:
-   - ❌ NO white or light-colored background card
-   - ❌ NO rounded rectangle panel
-   - ❌ NO background fill of any kind
+   - ❌ NO white/light content card behind everything
+   - ❌ NO rounded rectangle “panel” or page background
+   - ❌ NO background gradients/textures
    - ❌ NO checkerboard pattern
-   - ❌ NO semi-transparent overlay
+   - ❌ NO semi-transparent full-canvas overlays
+   - ❌ NO pure white text without an outline/shadow (white-on-white cannot be recovered by post-processing)
 
 5. VERIFICATION:
    - The final image should show ONLY content (text/charts/diagrams)
-   - Everything else should be completely transparent
-   - When placed on a colored background, only the content should be visible
+   - Everything else should be transparent (alpha=0) OR exactly #FF00FF for chroma-key (only if needed)
+   - When placed on a colored background, only the content should be visible (no white rectangle)
 
 EXAMPLE: Imagine rendering text and charts directly on a transparent canvas in Photoshop with no background layer.
 """
 ```
 
 **关键改进**:
-- ❌ 移除"内容卡片"要求
-- ✓ 明确要求整个背景透明
+- ❌ 移除“内容卡片”要求（避免生成白色矩形）
+- ✓ 明确“真透明优先，#FF00FF 色键兜底可选”（与现有后处理兼容）
 - ✓ 提供文字可读性的替代方案（描边、阴影、粗体）
 - ✓ 明确列出要避免的内容
 - ✓ 提供具体的验证标准
 
 ### 2.3 阶段2: 后处理算法
 
-即使优化了提示词，模型也可能不完全遵循。需要强大的后处理算法。
+即使优化了提示词，模型仍可能输出“浅色内容卡片/面板”。后处理应优先利用现有的两类强信号：
+1) **真 alpha**（模型真的输出透明背景）或 **#FF00FF 色键**（模型按提示给出统一背景）
+2) 仅在 1) 失败、且检测到“大面积浅色面板”时，才启用“面板去除”兜底
 
-#### 核心算法: 智能背景去除
+#### 核心算法: 面板去除（保守兜底，不做通用抠图）
 
 ```python
-def _remove_white_background(self, image_data: bytes, mime_type: str) -> tuple[bytes, str]:
+def _remove_light_panel_background(self, image_data: bytes, mime_type: str) -> tuple[bytes, str]:
     """
-    智能去除白色/浅色背景，只保留实际内容
+    在检测到“浅色内容卡片/面板”时，尝试移除面板背景，保留内容。
 
-    策略:
-    1. 检测并去除白色/浅色背景 (RGB > 阈值)
-    2. 保留深色文字和彩色图表
-    3. 边缘平滑处理（羽化）
-    4. 文字描边增强（可选）
+    重要约束：
+    - 仅作为兜底：当真 alpha / 色键 / 棋盘格检测都失败时启用
+    - 不保证保留“白色内容贴在白色面板上”这种本身不可读的情况
+    - 优先避免误删：宁可残留少量面板，也不应大量丢失内容
     """
-    from PIL import Image, ImageFilter, ImageEnhance
+    from PIL import Image, ImageOps, ImageFilter, ImageChops, ImageDraw, ImageStat
     import io
-    import numpy as np
 
-    # 加载图像
-    img = Image.open(io.BytesIO(image_data))
-    img = img.convert("RGBA")
-    arr = np.array(img, dtype=np.float32)
+    img = Image.open(io.BytesIO(image_data)).convert("RGBA")
+    w, h = img.size
 
-    rgb = arr[:,:,:3]
-    alpha = arr[:,:,3]
+    # 1) 先检测是否存在“面板/卡片”区域（复用现有 card bbox 思路：下采样 + 亮度阈值）
+    # 2) 若不存在明显面板，直接返回（避免误删）
+    # 3) 若存在面板：
+    #    - 估计面板的“背景颜色”（取面板 bbox 边缘/角落的多数色）
+    #    - 在面板内构建“内容掩码”：与背景色差异显著的像素视为内容
+    #    - 对内容掩码做轻微膨胀（包含抗锯齿边缘），再可选轻微模糊平滑边缘
+    #    - 将面板内“非内容”设为透明；面板外保持透明/原样
+    #
+    # 注：不依赖 numpy；如需加速可选引入 numpy，但不作为强制依赖。
 
-    # === 步骤1: 检测白色/浅色背景 ===
-    # 定义"背景"的标准:
-    # - 亮度高 (R+G+B > 阈值)
-    # - 饱和度低 (max-min < 阈值)
-    # - 当前不透明 (alpha = 255)
+    # 示例：用灰度阈值找亮区域 bbox（与现有 _extract_content_card_overlay 同方向）
+    gray_small = ImageOps.grayscale(img.convert("RGB").resize((256, 256)))
+    bin_small = gray_small.point(lambda p: 255 if p >= 220 else 0)
+    bbox = bin_small.getbbox()
+    if not bbox:
+        return image_data, mime_type
 
-    brightness = rgb.sum(axis=2)  # R+G+B
-    saturation = rgb.max(axis=2) - rgb.min(axis=2)  # max-min
+    # 4) 将 bbox 映射回原图坐标
+    x0, y0, x1, y1 = bbox
+    sx, sy = w / 256.0, h / 256.0
+    X0, Y0, X1, Y1 = int(x0 * sx), int(y0 * sy), int(x1 * sx), int(y1 * sy)
+    if X1 - X0 < w * 0.2 or Y1 - Y0 < h * 0.2:
+        return image_data, mime_type  # 面板太小，不处理
 
-    # 背景检测阈值
-    BRIGHTNESS_THRESHOLD = 660  # 220*3 (浅色)
-    SATURATION_THRESHOLD = 30   # 低饱和度
+    panel = img.crop((X0, Y0, X1, Y1))
+    panel_rgb = panel.convert("RGB")
 
-    is_background = (
-        (brightness > BRIGHTNESS_THRESHOLD) &
-        (saturation < SATURATION_THRESHOLD) &
-        (alpha == 255)
-    )
+    # 5) 估计面板背景色：取面板边框区域的均值色（更不容易被正文污染）
+    bw, bh = panel.size
+    border = Image.new("L", (bw, bh), 0)
+    draw = ImageDraw.Draw(border)
+    t = max(2, min(bw, bh) // 40)  # border thickness
+    draw.rectangle([0, 0, bw - 1, bh - 1], outline=255, width=t)
+    stat = ImageStat.Stat(panel_rgb, mask=border)
+    bg = tuple(int(v) for v in stat.mean)
 
-    # === 步骤2: 渐进式背景去除 ===
-    # 不是简单地设置alpha=0，而是根据亮度渐进调整
+    # 6) 以“与背景色的差异”判定内容，而不是简单亮度阈值
+    diff = ImageChops.difference(panel_rgb, Image.new("RGB", (bw, bh), bg))
+    diff_gray = ImageOps.grayscale(diff)
+    content_diff_threshold = 25  # 可配置
+    content = diff_gray.point(lambda p: 255 if p >= content_diff_threshold else 0)
 
-    new_alpha = alpha.copy()
+    # 7) 边缘处理：轻微膨胀包含抗锯齿边缘，再可选轻微平滑
+    edge_expand = 2  # 可配置
+    content = content.filter(ImageFilter.MaxFilter(edge_expand * 2 + 1))
+    edge_blur = 0.8  # 可配置（建议很小）
+    if edge_blur > 0:
+        content = content.filter(ImageFilter.GaussianBlur(radius=edge_blur))
 
-    # 完全背景: 直接设为透明
-    fully_background = (brightness > 700) & (saturation < 20)
-    new_alpha[fully_background] = 0
-
-    # 浅色背景: 渐进透明
-    light_background = is_background & ~fully_background
-    if np.any(light_background):
-        # 根据亮度计算透明度: 越亮越透明
-        brightness_bg = brightness[light_background]
-        # 映射: 660->128, 700->0
-        alpha_values = np.clip(255 - (brightness_bg - 660) * 255 / 40, 0, 128)
-        new_alpha[light_background] = alpha_values
-
-    # === 步骤3: 边缘平滑 ===
-    # 使用形态学操作平滑边缘
-
-    alpha_img = Image.fromarray(new_alpha.astype(np.uint8), mode='L')
-
-    # 轻微腐蚀去除噪点
-    alpha_img = alpha_img.filter(ImageFilter.MinFilter(3))
-
-    # 高斯模糊平滑边缘
-    alpha_img = alpha_img.filter(ImageFilter.GaussianBlur(radius=1.5))
-
-    new_alpha = np.array(alpha_img)
-
-    # === 步骤4: 组合结果 ===
-    arr[:,:,3] = new_alpha
-
-    result_img = Image.fromarray(arr.astype(np.uint8), mode='RGBA')
-
-    # === 步骤5: 可选的文字增强 ===
-    # 如果检测到大量文字，可以添加描边增强可读性
-    # (这部分可以作为高级选项)
+    # 8) 将面板内非内容设为透明（用 content 掩码作为 alpha）
+    out = img.copy()
+    out_alpha = out.getchannel("A")
+    out_alpha.paste(content, (X0, Y0))
+    out.putalpha(out_alpha)
 
     buf = io.BytesIO()
-    result_img.save(buf, format="PNG")
+    out.save(buf, format="PNG")
     return buf.getvalue(), "image/png"
 ```
 
 #### 算法特点
 
-1. **智能检测**: 基于亮度和饱和度检测背景，而不是简单的颜色阈值
-2. **渐进处理**: 不是简单的二值化，而是渐进调整透明度
-3. **边缘平滑**: 使用形态学操作和高斯模糊平滑边缘
-4. **保留内容**: 只去除浅色低饱和度区域，保留所有有色内容
+1. **优先强信号**: 先走“真 alpha / #FF00FF 色键 / 棋盘格”，最后才做面板去除兜底
+2. **以“背景色差异”判定内容**: 以“与估计面板背景色的差值”识别前景，避免简单亮度阈值误删浅色内容
+3. **保守策略**: 无法判断的像素更倾向保留（避免误删）
+4. **可控边缘**: 掩码膨胀 + 轻微平滑，尽量降低锯齿，同时避免产生明显白边光晕
+
+#### 关于“白边/光晕（Color Fringing）”
+
+对 alpha 做模糊会产生半透明像素；若这些像素的 RGB 仍是面板白色，会在有色 PPT 背景上出现白边。
+因此更推荐：
+- 先做内容掩码的膨胀（包含抗锯齿边缘），尽量减少对“面板背景 RGB”做半透明化
+- 对最终 alpha=0 的像素将 RGB 置零（或置为邻域内容色）以减少残留背景色的影响（可选增强项）
 
 ### 2.4 配置选项
 
@@ -254,17 +276,19 @@ def _remove_white_background(self, image_data: bytes, mime_type: str) -> tuple[b
 class TransparencyConfig:
     """透明度配置"""
     enabled: bool = False  # 是否启用透明背景
-    remove_white_bg: bool = True  # 是否去除白色背景（新增）
-    brightness_threshold: int = 660  # 背景亮度阈值（新增）
-    edge_smoothing: float = 1.5  # 边缘平滑半径（新增）
-    text_enhancement: bool = False  # 是否增强文字（新增）
+    cleanup_light_panel: bool = True  # 是否启用“浅色面板去除”兜底（新增）
+    panel_detect_luma: int = 220  # 面板检测亮度阈值（新增）
+    content_diff_threshold: int = 25  # 与面板背景色差阈值（新增）
+    edge_expand: int = 2  # 内容掩码膨胀像素（新增）
+    edge_blur: float = 0.8  # 边缘平滑半径（新增，建议很小）
 ```
 
 命令行参数：
 ```bash
 --transparent-bg  # 启用透明背景
---keep-white-bg   # 保留白色背景（不去除）
---bg-threshold 660  # 背景检测阈值
+--keep-light-panel  # 保留浅色面板（关闭兜底清理，新增）
+--panel-luma 220  # 面板检测阈值（新增）
+--content-diff 25  # 内容/面板背景色差阈值（新增）
 ```
 
 ### 2.5 质量评估
@@ -274,51 +298,39 @@ class TransparencyConfig:
 class TransparencyQuality:
     """透明度质量评估"""
     score: float  # 0-100分
-    transparent_ratio: float  # 透明像素比例
-    white_bg_removed: bool  # 是否成功去除白色背景
-    edge_quality: str  # "smooth" | "jagged"
+    has_large_light_panel: bool  # 是否存在大面积浅色面板残留
+    light_panel_ratio: float  # 不透明区域中“浅色低饱和”比例（诊断项）
+    edge_quality: str  # "smooth" | "jagged"（诊断项）
     warnings: List[str]
 
 def assess_transparency_quality_v2(img: Image) -> TransparencyQuality:
     """评估透明度质量"""
-    arr = np.array(img)
-    alpha = arr[:,:,3]
-    rgb = arr[:,:,:3]
+    # 下采样做诊断，避免全分辨率遍历过慢；不要求 numpy 依赖
+    img = img.convert("RGBA").resize((256, 256))
+    alpha = list(img.getchannel("A").getdata())
+    rgb = list(img.convert("RGB").getdata())
 
-    # 计算透明像素比例
-    transparent_ratio = np.sum(alpha < 10) / alpha.size
-
-    # 检查是否还有白色背景
-    opaque_mask = alpha > 200
-    if np.any(opaque_mask):
-        opaque_rgb = rgb[opaque_mask]
-        white_pixels = np.sum(
-            (opaque_rgb[:,0] > 240) &
-            (opaque_rgb[:,1] > 240) &
-            (opaque_rgb[:,2] > 240)
-        )
-        white_ratio = white_pixels / np.sum(opaque_mask)
-        white_bg_removed = white_ratio < 0.1  # 少于10%白色
+    # 检查是否还有“大面积浅色面板/背景”
+    opaque_idx = [i for i, a in enumerate(alpha) if a > 200]
+    if opaque_idx:
+        light_neutral = 0
+        for i in opaque_idx:
+            r, g, b = rgb[i]
+            if (r + g + b > 660) and (max(r, g, b) - min(r, g, b) < 30):
+                light_neutral += 1
+        light_panel_ratio = light_neutral / len(opaque_idx)
+        has_large_light_panel = light_panel_ratio > 0.30  # 更偏“告警阈值”，非硬 KPI
     else:
-        white_bg_removed = True
+        light_panel_ratio = 0.0
+        has_large_light_panel = False
 
     # 评分
     score = 0
-    if transparent_ratio > 0.5:
-        score += 40  # 大部分透明
-    elif transparent_ratio > 0.3:
-        score += 25
-    else:
-        score += 10
-
-    if white_bg_removed:
-        score += 40  # 成功去除白色背景
-    else:
-        score += 10
+    score += 60 if not has_large_light_panel else 25
 
     # 边缘质量
-    semi_transparent = np.sum((alpha > 10) & (alpha < 245))
-    semi_ratio = semi_transparent / alpha.size
+    semi_transparent = sum(1 for a in alpha if 10 < a < 245)
+    semi_ratio = semi_transparent / len(alpha)
     if semi_ratio > 0.02:
         score += 20
         edge_quality = "smooth"
@@ -327,19 +339,19 @@ def assess_transparency_quality_v2(img: Image) -> TransparencyQuality:
         edge_quality = "jagged"
 
     warnings = []
-    if not white_bg_removed:
-        warnings.append("White background not fully removed")
-    if transparent_ratio < 0.3:
-        warnings.append("Low transparency ratio")
+    if has_large_light_panel:
+        warnings.append("Large light panel/background remains (may look like a white rectangle in PPT)")
 
     return TransparencyQuality(
         score=score,
-        transparent_ratio=transparent_ratio,
-        white_bg_removed=white_bg_removed,
+        has_large_light_panel=has_large_light_panel,
+        light_panel_ratio=light_panel_ratio,
         edge_quality=edge_quality,
         warnings=warnings
     )
 ```
+
+> 注：透明像素比例（transparent_ratio）不作为硬指标，因为全幅图表/大图片天然不透明像素多；更关键的是“是否存在大面积浅色面板残留”。
 
 ## 3. 技术实现
 
@@ -347,17 +359,17 @@ def assess_transparency_quality_v2(img: Image) -> TransparencyQuality:
 
 #### 文件1: `paper2slides/generator/image_generator.py`
 
-**修改点1**: 替换透明背景提示词 (365-377行)
+**修改点1**: 替换透明背景提示词（`_build_poster_prompt` / `_build_slide_prompt` 内）
 ```python
-# 删除当前的"内容卡片"提示词
-# 使用新的TRANSPARENT_BG_PROMPT_V2
+# 移除“content card”要求
+# 保留“真透明优先 + #FF00FF 色键兜底”要求
+# 使用新的 TRANSPARENT_BG_PROMPT_V2
 ```
 
-**修改点2**: 添加白色背景去除方法 (新增)
+**修改点2**: 添加“浅色面板去除”方法（新增）
 ```python
-def _remove_white_background(self, image_data: bytes, mime_type: str) -> tuple[bytes, str]:
-    """智能去除白色/浅色背景"""
-    # 实现如上所述
+def _remove_light_panel_background(self, image_data: bytes, mime_type: str) -> tuple[bytes, str]:
+    """在检测到浅色面板时移除面板背景，保留内容（保守兜底）"""
 ```
 
 **修改点3**: 修改`_to_transparent_png`方法 (476-589行)
@@ -367,18 +379,12 @@ def _to_transparent_png(self, image_data: bytes, mime_type: str) -> tuple[bytes,
     改进的透明度处理
 
     流程:
-    1. 尝试色度键控（如果模型使用了特殊颜色）
-    2. 去除白色/浅色背景（核心步骤）
-    3. 边缘平滑处理
-    4. 质量评估
+    1. 若已有真实 alpha：可选检测是否仍存在“大面积浅色面板”，必要时做兜底清理
+    2. 若无 alpha：先尝试 #FF00FF 色键（强信号）
+    3. 再尝试去除“假透明棋盘格”
+    4. 最后：仅在检测到浅色面板时，启用面板去除兜底
     """
-    # 先尝试色度键控
-    keyed = self._key_out_chroma(...)
-    if keyed:
-        return keyed
-
-    # 去除白色背景（核心）
-    return self._remove_white_background(image_data, mime_type)
+    ...
 ```
 
 **修改点4**: 在生成流程中调用 (192-194, 234-236, 276-278行)
@@ -404,17 +410,18 @@ TRANSPARENT_BG_PROMPT_V2 = """..."""  # 如上所述
 @dataclass
 class TransparencyConfig:
     enabled: bool = False
-    remove_white_bg: bool = True  # 新增
-    brightness_threshold: int = 660  # 新增
-    edge_smoothing: float = 1.5  # 新增
+    cleanup_light_panel: bool = True  # 新增
+    panel_detect_luma: int = 220  # 新增
+    content_diff_threshold: int = 25  # 新增
+    edge_blur: float = 0.8  # 新增
 ```
 
 ### 3.2 实施步骤
 
 #### 步骤1: 核心算法实现 (优先级P0)
-1. 实现`_remove_white_background`方法
-2. 测试不同亮度阈值的效果
-3. 优化边缘平滑算法
+1. 实现`_remove_light_panel_background`方法（面板去除兜底）
+2. 调优：面板检测阈值、内容/背景色差阈值
+3. 优化边缘处理（掩码膨胀 + 轻微平滑，避免白边）
 
 #### 步骤2: 提示词优化 (优先级P0)
 1. 替换透明背景提示词
@@ -435,19 +442,17 @@ class TransparencyConfig:
 
 #### 单元测试
 ```python
-def test_remove_white_background():
-    """测试白色背景去除"""
-    # 创建测试图像：白色背景 + 黑色文字
-    # 验证背景被去除，文字保留
+def test_key_out_magenta_background():
+    """测试 #FF00FF 色键抠图：背景透明、内容保留"""
 
-def test_brightness_threshold():
-    """测试不同亮度阈值"""
-    # 测试660, 680, 700等不同阈值
-    # 验证效果
+def test_remove_light_panel_background_basic():
+    """测试浅色面板去除：面板透明、黑字/彩色图表保留"""
 
-def test_edge_smoothing():
-    """测试边缘平滑"""
-    # 验证边缘无锯齿
+def test_remove_light_panel_preserve_outlined_text():
+    """测试白字+深色描边：即使面板去除也能保留（依赖提示词约束）"""
+
+def test_quality_assessment_warns_on_large_panel():
+    """测试质量评估：残留大面积浅色面板时给出告警"""
 ```
 
 #### 集成测试
@@ -456,7 +461,7 @@ def test_end_to_end_transparency():
     """端到端测试"""
     # 生成slides
     # 检查透明度质量
-    # 验证白色背景已去除
+    # 验证无大面积浅色面板残留（避免白色矩形）
 ```
 
 #### 视觉测试
@@ -467,25 +472,23 @@ def test_end_to_end_transparency():
 
 ### 3.4 性能考虑
 
-- **白色背景去除**: 增加处理时间约10-15%
-- **边缘平滑**: 增加处理时间约5%
-- **总体影响**: 约15-20%，可接受
+- 后处理耗时与图像尺寸线性相关；优先使用 Pillow 的轻量操作，通常可接受。
+- 如需要更高性能，可选引入 numpy 做向量化，但应作为可选依赖并提供无 numpy 的降级路径。
 
 **优化措施**:
-- 使用numpy向量化操作（已采用）
-- 避免循环，使用广播
-- 可选的并行处理
+- 下采样检测（256x256）用于面板判断/定位，避免全分辨率重计算
+- 仅在检测到问题时启用兜底清理，减少不必要开销
 
 ## 4. 预期效果
 
 ### 4.1 改进前后对比
 
-| 指标 | 改进前 | 改进后 | 改进幅度 |
+| 指标 | 改进前 | 改进后（目标） | 说明 |
 |------|--------|--------|----------|
-| 透明像素比例 | 27% | >70% | +160% |
-| 白色背景像素 | 75% | <10% | -87% |
+| 透明像素比例 | 27% | 不设硬目标 | 取决于版面内容（全幅图表会更不透明） |
+| 不透明浅色面板占比（诊断） | 75% | <15%（告警阈值 30%） | 避免 PPT 中出现白色矩形/面板感 |
 | PPT插入效果 | 白色矩形 | 内容浮动 | 质的飞跃 |
-| 透明度质量评分 | 40/100 | >80/100 | +100% |
+| 透明度质量评分 | 40/100 | ≥80/100 | 面向大多数页面的目标 |
 | 适配PPT模板 | 仅浅色 | 任意颜色 | 通用性提升 |
 
 ### 4.2 用户体验改进
@@ -508,16 +511,16 @@ def test_end_to_end_transparency():
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|----------|
-| 误删有用内容 | 高 | 低 | 保守的阈值，只删除高亮度低饱和度区域 |
-| 文字可读性下降 | 中 | 中 | 提供文字增强选项，用户可配置 |
-| 边缘锯齿 | 低 | 低 | 高斯模糊和形态学操作 |
-| 性能下降 | 低 | 低 | numpy向量化，影响可控 |
+| 误删浅色前景（白字/浅灰线条） | 高 | 中 | 提示词强制描边/阴影；后处理以“背景色差异”判定内容且保守；提供 `--keep-light-panel` 退回旧行为 |
+| 文字可读性下降 | 中 | 中 | 通过提示词要求描边/阴影；必要时提供可选的文字增强（后续项） |
+| 白边/光晕 | 中 | 中 | 避免对背景 RGB 做半透明化；必要时做 RGB 去污染/置零（可选增强） |
+| 性能下降 | 低 | 低 | 下采样检测 + 仅在触发兜底时处理；如需更高性能可选引入 numpy |
 
 ### 5.2 兼容性风险
 
 - **向后兼容**: 保持现有API，新功能通过参数控制
-- **默认行为**: `--transparent-bg`默认启用白色背景去除
-- **退出机制**: 提供`--keep-white-bg`参数保留旧行为
+- **默认行为**: `--transparent-bg` 默认启用“浅色面板去除”兜底（以避免白色矩形）
+- **退出机制**: 提供 `--keep-light-panel` 参数保留旧行为（仅色键/棋盘格，不做面板去除）
 
 ## 6. 实施计划
 
@@ -525,7 +528,7 @@ def test_end_to_end_transparency():
 
 **阶段1: 核心算法** (1-2天)
 - [x] 分析问题根因
-- [ ] 实现`_remove_white_background`方法
+- [ ] 实现`_remove_light_panel_background`方法
 - [ ] 测试和调优阈值
 
 **阶段2: 提示词优化** (0.5天)
@@ -546,16 +549,14 @@ def test_end_to_end_transparency():
 ### 6.2 验收标准
 
 1. **功能完整性**
-   - ✓ 白色背景成功去除（<10%白色像素）
-   - ✓ 透明像素比例 >70%
-   - ✓ 边缘平滑无锯齿
-   - ✓ 实际内容完整保留
+   - ✓ PPT 插入后不出现“白色矩形/面板”
+   - ✓ 真 alpha / #FF00FF 色键 / 棋盘格 三条路径至少一条稳定生效
+   - ✓ 面板兜底启用时，内容不发生大面积丢失（保守优先）
 
 2. **质量标准**
    - ✓ 透明度质量评分 ≥ 80/100（90%的cases）
-   - ✓ 在深色PPT模板上可读性良好
-   - ✓ 在浅色PPT模板上可读性良好
-   - ✓ 无白色矩形效果
+   - ✓ 在深色/浅色 PPT 模板上大多数页面可读（依赖描边/阴影提示词约束）
+   - ✓ `has_large_light_panel` 为 False（或仅轻微告警）
 
 3. **性能标准**
    - ✓ 处理时间增加 ≤ 20%
@@ -585,22 +586,27 @@ def test_end_to_end_transparency():
 ```
 输入: 生成的图像 (RGBA)
   ↓
-检测白色/浅色背景
-  ├─ 亮度检测 (R+G+B > 660)
-  ├─ 饱和度检测 (max-min < 30)
-  └─ 当前不透明 (alpha = 255)
-  ↓
-渐进式背景去除
-  ├─ 完全背景 (亮度>700) → alpha=0
-  └─ 浅色背景 (660-700) → alpha=0-128
-  ↓
-边缘平滑
-  ├─ 形态学腐蚀 (去噪)
-  └─ 高斯模糊 (平滑)
+是否已有真实透明(alpha<255)?
+  ├─ 是：可选检测“大面积浅色面板”
+  │     ├─ 无：直接输出 PNG
+  │     └─ 有：启用“浅色面板去除”兜底 → 输出 PNG
+  └─ 否：
+        ↓
+    尝试 #FF00FF 色键抠图（强信号）
+        ├─ 成功：输出 PNG
+        └─ 失败：
+              ↓
+          尝试检测/去除“假透明棋盘格”
+              ├─ 成功：输出 PNG
+              └─ 失败：
+                    ↓
+                检测浅色面板/内容卡片 bbox
+                    ├─ 未检测到：原样输出 PNG（避免误删）
+                    └─ 检测到：面板内按“与背景色差异”提取内容 → 输出 PNG
   ↓
 质量评估
-  ├─ 透明像素比例
-  ├─ 白色背景残留
+  ├─ 是否残留大面积浅色面板（has_large_light_panel）
+  ├─ 浅色面板占比（light_panel_ratio，诊断项）
   └─ 边缘质量
   ↓
 输出: 真正透明的PNG
@@ -610,24 +616,28 @@ def test_end_to_end_transparency():
 
 | 阈值类型 | 推荐值 | 说明 |
 |---------|--------|------|
-| 亮度阈值 | 660 | 220*3，检测浅色背景 |
-| 完全背景阈值 | 700 | 233*3，完全去除 |
-| 饱和度阈值 | 30 | 检测低饱和度（灰白色） |
-| 边缘平滑半径 | 1.5 | 高斯模糊半径 |
+| 色键容差（chroma key tol） | 18 | 与现有 `_key_out_chroma(..., tol=18)` 对齐 |
+| 面板检测亮度阈值（panel_detect_luma） | 220 | 下采样灰度阈值，用于找浅色面板 bbox |
+| 内容/背景色差阈值（content_diff_threshold） | 25 | 以“与估计面板背景色差异”判断内容 |
+| 掩码膨胀（edge_expand） | 2 | 包含抗锯齿边缘，减少锯齿 |
+| 边缘平滑（edge_blur） | 0.8 | 建议很小，过大易产生白边/光晕 |
 
 ### 8.3 常见问题
 
 **Q: 会不会误删浅色文字？**
-A: 不会。算法同时检查亮度和饱和度，浅色文字通常有一定饱和度或与背景有对比度。
+A: 有可能，尤其是“白色/浅灰文字贴在白色面板上”这种本身不可读的情况。为降低风险：
+1) 提示词要求文字必须有描边/阴影（避免白-on-白）
+2) 后处理以“与面板背景色差异”判定内容，并采取保守策略
+3) 提供 `--keep-light-panel` 关闭兜底清理以回退旧行为
 
 **Q: 深色背景上的文字可读性如何保证？**
 A: 可以启用文字增强选项，添加描边或阴影。或者在提示词中要求使用浅色文字。
 
 **Q: 性能影响大吗？**
-A: 约15-20%的处理时间增加，使用numpy向量化操作，影响可控。
+A: 取决于图像尺寸与是否触发兜底清理。默认仅在检测到“大面积浅色面板”时额外处理；如需更高性能可选引入 numpy。
 
 **Q: 可以保留旧的行为吗？**
-A: 可以，使用`--keep-white-bg`参数保留白色背景。
+A: 可以，使用 `--keep-light-panel` 参数关闭浅色面板去除兜底。
 
 ---
 
