@@ -288,10 +288,17 @@ outputs/
 | `doraemon` | Colorful, friendly style with illustrations |
 | `custom` | Any text description for LLM-generated style |
 
+### Image Generation Providers
+
+- Set `IMAGE_GEN_PROVIDER` in `paper2slides/.env` to choose the backend:
+  - `openrouter` (default): uses `IMAGE_GEN_API_KEY`, `IMAGE_GEN_BASE_URL`, and `IMAGE_GEN_MODEL` (default `google/gemini-3-pro-image-preview`)
+  - `google`: uses the official Gemini API at `GOOGLE_GENAI_BASE_URL` (default `https://generativelanguage.googleapis.com/v1beta`), `IMAGE_GEN_API_KEY`, `IMAGE_GEN_MODEL` (default `models/gemini-3-pro-image-preview`, must be image-capable), and `IMAGE_GEN_RESPONSE_MIME_TYPE` (default `text/plain`; use text types if your model does not support image responses)
+- Reference figures are sent as inline data when supported (Google) or as `image_url` attachments (OpenRouter).
+
 ### Image Generation Notes
 
 > [!TIP]
-> Paper2Slides uses `gemini-3-pro-image-preview` (Nano Banana Pro Preview) for image generation. Key findings:
+> By default Paper2Slides uses `gemini-3-pro-image-preview` (OpenRouter) for image generation; you can switch to an image-capable Google Gemini model (e.g., `models/gemini-1.5-flash`) via `IMAGE_GEN_PROVIDER=google`. Key findings:
 > 
 > - **Mood Keywords**: Words like "warm", "elegant", "vibrant" strongly influence the overall color palette
 > - **Layout vs Style**: Fine-grained *layout* instructions ground well; fine-grained *element styling* does not
