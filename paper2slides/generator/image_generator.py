@@ -16,6 +16,7 @@ from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import GenerationInput
+from ..utils.api_client import create_custom_client
 from .content_planner import ContentPlan, Section
 from ..prompts.image_generation import (
     STYLE_PROCESS_PROMPT,
@@ -57,14 +58,36 @@ class ProcessedStyle:
 def process_custom_style(client: OpenAI, user_style: str, model: str = None) -> ProcessedStyle:
     """Process user's custom style request with LLM."""
     model = model or os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
-    
+
+    # Create a dedicated RAG client for style processing
+    rag_api_key = os.getenv("RAG_LLM_API_KEY")
+    rag_base_url = os.getenv("RAG_LLM_BASE_URL")
+
+    if not rag_api_key:
+        return ProcessedStyle(style_name="", color_tone="", special_elements="", decorations="", valid=False, error="RAG_LLM_API_KEY not configured")
+
     try:
-        response = client.chat.completions.create(
+        # Use custom client for RAG processing
+        rag_client = create_custom_client(rag_api_key, rag_base_url)
+
+        response = rag_client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": STYLE_PROCESS_PROMPT.format(user_style=user_style)}],
-            response_format={"type": "json_object"},
         )
-        result = json.loads(response.choices[0].message.content)
+
+        # Parse JSON from response content
+        content = response.choices[0].message.content.strip()
+
+        # Try to extract JSON from the content
+        import re
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(0)
+            result = json.loads(json_str)
+        else:
+            # If no JSON found, try parsing the entire content
+            result = json.loads(content)
+
         return ProcessedStyle(
             style_name=result.get("style_name", ""),
             color_tone=result.get("color_tone", ""),
@@ -73,6 +96,8 @@ def process_custom_style(client: OpenAI, user_style: str, model: str = None) -> 
             valid=result.get("valid", False),
             error=result.get("error"),
         )
+    except json.JSONDecodeError as e:
+        return ProcessedStyle(style_name="", color_tone="", special_elements="", decorations="", valid=False, error=f"JSON parsing failed: {str(e)}")
     except Exception as e:
         return ProcessedStyle(style_name="", color_tone="", special_elements="", decorations="", valid=False, error=str(e))
 
