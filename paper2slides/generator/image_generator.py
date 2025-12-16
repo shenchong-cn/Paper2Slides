@@ -1023,7 +1023,7 @@ class ImageGenerator:
                     url,
                     params={"key": self.api_key},
                     json=payload,
-                    timeout=60,
+                    timeout=120,
                 )
                 
                 if response.status_code >= 400:
