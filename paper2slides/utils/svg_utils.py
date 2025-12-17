@@ -33,17 +33,57 @@ def extract_svg(text: str) -> str:
     Supports:
     - Markdown fenced blocks (```xml|svg)
     - Noisy prefixes/suffixes around a <svg>...</svg> region
+    - Self-closing SVG tags (<svg ... />)
+    - XML declaration with SVG
     """
     if not text:
         raise SvgValidationError("Empty SVG output")
 
+    # First try to extract from fenced code blocks
     fenced = re.search(r"```(?:xml|svg)?\s*\n(.*?)\n```", text, re.DOTALL | re.IGNORECASE)
     if fenced:
         text = fenced.group(1)
 
+    # Look for complete SVG block
     start = text.find("<svg")
     end = text.rfind("</svg>")
+
+    # If no closing tag found, check for self-closing SVG
+    if start != -1 and (end == -1 or end <= start):
+        # Look for self-closing SVG tag
+        self_closing_match = re.search(r'<svg[^>]*?/>', text, re.IGNORECASE)
+        if self_closing_match:
+            return self_closing_match.group(0)
+
     if start == -1 or end == -1 or end <= start:
+        # Try to find XML declaration followed by SVG
+        xml_match = re.search(r'<\?xml[^>]*\>\s*<svg[^>]*>.*?</svg>', text, re.DOTALL | re.IGNORECASE)
+        if xml_match:
+            return xml_match.group(0).strip()
+
+        # As a last resort, try to find any <svg> tag and assume it goes to end of content
+        start = text.find("<svg")
+        if start != -1:
+            # Find the end of the SVG content by looking for the next top-level tag or end of string
+            remaining = text[start:]
+            # Try to find matching closing tag
+            tag_count = 0
+            pos = 0
+            svg_end = -1
+
+            for match in re.finditer(r'<(/?)(svg)[^>]*>', remaining, re.IGNORECASE):
+                if match.group(1) == '/':
+                    tag_count -= 1
+                else:
+                    tag_count += 1
+
+                if tag_count == 0:
+                    svg_end = match.end()
+                    break
+
+            if svg_end != -1:
+                return remaining[:svg_end].strip()
+
         raise SvgValidationError("No <svg>...</svg> block found")
 
     svg_text = text[start : end + len("</svg>")].strip()
