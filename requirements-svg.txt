@@ -1,0 +1,10 @@
+# Optional dependencies for SVG output (SVG -> PNG rasterization)
+#
+# Install ONE of the following:
+#   pip install -r requirements-svg.txt
+#
+# Preferred (usually best rendering quality):
+cairosvg>=2.7.0
+#
+# Fallback alternative (uncomment if you prefer this stack instead of cairosvg):
+# svglib>=1.5.0
