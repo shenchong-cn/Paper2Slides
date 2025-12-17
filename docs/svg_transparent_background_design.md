@@ -75,13 +75,15 @@
 
 ### 1.1.2 模型与 Provider 配置策略（建议明确）
 
-SVG 生成本质是“文本生成”（可能带参考图），与当前“图像生成”链路使用的 `IMAGE_GEN_*` 环境变量耦合较强。为避免互相干扰，建议在实现中引入独立配置（可先用环境变量，后续再下沉到 `GenerationConfig`）：
-- `SVG_GEN_PROVIDER`（默认沿用 `IMAGE_GEN_PROVIDER`）
-- `SVG_GEN_API_KEY` / `SVG_GEN_BASE_URL`（默认沿用 `IMAGE_GEN_API_KEY` / `IMAGE_GEN_BASE_URL`）
-- `SVG_GEN_MODEL`（默认可沿用 `LLM_MODEL` 或单独指定）
-- `SVG_GEN_MAX_TOKENS`（默认 6000~10000，视模型上下文而定）
+SVG 生成本质是“文本生成”（可能带参考图），与当前“图像生成”链路使用的 `IMAGE_GEN_*` 环境变量耦合较强。
 
-这样可以做到：PNG 仍走“图像模型”，SVG 走“文本模型”，避免因为全局 `IMAGE_GEN_RESPONSE_MIME_TYPE` 切换而影响现有 PNG 行为。
+**本次实施决策：复用 `IMAGE_GEN_*` 配置（不新增 `SVG_GEN_*`）**，以减少配置面与迁移成本。
+
+实现注意事项（必须写进代码逻辑而非靠使用者配置）：
+- SVG 文本调用需要**强制按文本响应解析**（不可依赖全局 `IMAGE_GEN_RESPONSE_MIME_TYPE`），否则会影响现有 PNG 行为或导致 provider 路径分叉。
+- Google 路径需设置 `generationConfig.responseMimeType="text/plain"` 并从 `parts[].text` 读取输出（可复用现有 `requests` 调用形态）。
+
+（后续可选优化）如需要更强隔离，可再引入 `SVG_GEN_*`（provider/model/max_tokens）做解耦。
 
 ### 1.2 核心流程
 
@@ -556,16 +558,18 @@ def _call_google_for_text(self, prompt: str, reference_images: list[dict]) -> st
 
 **generate_stage.py 修改要点：**
 
-评审补充：当前 `paper2slides/core/stages/generate_stage.py` 采用“生成时 save_callback 立即落盘”的写法；实现 SVG 后有两种落地路径，建议二选一并写死（避免行为分叉导致难测）：
-1. **保留 save_callback（推荐最小改动）**：在 callback 内识别 `image/svg+xml`，写 `.svg`；若需要 PDF，则在 callback 或生成后阶段同步/异步栅格化出 `.png`，并将 PNG 列表用于 `save_images_as_pdf()`。
-2. **取消 save_callback、统一 stage 落盘**：`ImageGenerator.generate()` 只返回内存结果，由 stage 统一保存（更清晰但改动面更大）。
+评审补充：当前 `paper2slides/core/stages/generate_stage.py` 采用“生成时 save_callback 立即落盘”的写法。
+
+**本次实施决策：保留 `save_callback` 方案（最小改动）**：
+- callback：按 `mime_type` 写 `.svg/.png/.jpg/.webp`
+- stage：生成完成后，基于 `images` 列表组装“用于 PDF 的位图列表”；若遇到 SVG 且 `svg_export_png=true`，则对已落盘的 `.svg` 栅格化出 `.png` 再读回 bytes；最后调用 `save_images_as_pdf()`
 
 ```python
 async def run_generate_stage(base_dir: Path, config_dir: Path, config: Dict) -> Dict:
     # ... 现有代码 ...
 
     # 生成图像（注意：当前实现签名为 generator.generate(plan, gen_input, ...)）
-    images = generator.generate(plan, gen_input, max_workers=config.get("max_workers", 1))
+    images = generator.generate(plan, gen_input, max_workers=config.get("max_workers", 1), save_callback=save_image_callback)
 
     # 保存图像并处理 SVG
     output_dir = get_output_dir(config_dir)
@@ -574,37 +578,14 @@ async def run_generate_stage(base_dir: Path, config_dir: Path, config: Dict) -> 
 
     for img in images:
         if img.mime_type == "image/svg+xml":
-            # 保存 SVG
-            svg_path = output_dir / f"{img.section_id}.svg"
-            svg_path.write_text(img.image_data.decode("utf-8"), encoding="utf-8")
-            saved_files.append(svg_path)
-
-            # 根据配置决定是否导出 PNG
             if config.get("svg_export_png", True):
-                png_path = output_dir / f"{img.section_id}.png"
-                svg_to_png(
-                    str(svg_path),
-                    str(png_path),
-                    width=config.get("svg_viewbox_width", 1920),
-                    height=config.get("svg_viewbox_height", 1080)
-                )
-                images_for_pdf.append(GeneratedImage(
-                    section_id=img.section_id,
-                    image_data=png_path.read_bytes(),
-                    mime_type="image/png",
-                ))
-            elif config.get("output_type") == "slides":
-                # 警告：slides 模式下没有 PNG，无法生成 PDF
-                logger.warning(
-                    f"SVG mode without PNG export: slides.pdf will not be generated. "
-                    f"Use --format both or enable svg_export_png to generate PDF."
-                )
+                svg_path = output_dir / f\"{img.section_id}.svg\"  # callback 已落盘
+                png_path = output_dir / f\"{img.section_id}.png\"
+                svg_to_png(str(svg_path), str(png_path), width=..., height=...)
+                images_for_pdf.append(GeneratedImage(img.section_id, png_path.read_bytes(), \"image/png\"))
+            else:
+                logger.warning(\"SVG without PNG export: skip slides.pdf\")
         else:
-            # 保存位图（PNG/JPEG/WEBP）
-            ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}[img.mime_type]
-            img_path = output_dir / f"{img.section_id}{ext}"
-            img_path.write_bytes(img.image_data)
-            saved_files.append(img_path)
             images_for_pdf.append(img)
 
     # 生成 PDF（仅 slides 模式且有 PNG 文件）
