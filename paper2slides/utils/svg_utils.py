@@ -388,7 +388,9 @@ def svg_to_png_bytes(svg_bytes: bytes, width: int, height: int, background_color
             output_height=height,
             background_color=background_color,
         )
-    except ImportError:
+    except (ImportError, OSError) as e:
+        # Handle both missing cairosvg and missing system Cairo libraries
+        print(f"Warning: CairoSVG not available ({e}), trying svglib fallback...")
         pass
 
     try:
@@ -403,7 +405,7 @@ def svg_to_png_bytes(svg_bytes: bytes, width: int, height: int, background_color
         return png
     except ImportError as e:
         raise ImportError(
-            "SVG->PNG rasterization requires 'cairosvg' or 'svglib'. "
+            "SVG->PNG rasterization requires 'cairosvg' (with system Cairo libraries) or 'svglib'. "
             "Install one of them to enable SVG export to PNG/PDF and bitmap style references."
         ) from e
 
