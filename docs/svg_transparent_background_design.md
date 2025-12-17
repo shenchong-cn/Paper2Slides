@@ -2,13 +2,19 @@
 
 ## 文档信息
 - **创建日期**: 2025-12-17
-- **版本**: v1.2（评审修订：补充依赖声明、明确实施细节、完善 API 适配）
+- **版本**: v1.3（评审修订：补充 GitHub 追踪信息、对齐现有 CLI/Stage 保存逻辑、补齐依赖可行性与测试落地路径）
 - **作者**: Claude Code
-- **相关Issue**: PNG 透明背景效果不佳，改用 SVG 矢量格式
+- **GitHub 仓库**: https://github.com/shenchong-cn/Paper2Slides
+- **评审对齐代码版本**: `71adb42`
+- **相关 GitHub Issue / PR**:
+  - Issue: （待填，例如 `#123`）
+  - PR: （待填，例如 `#456`）
+- **相关问题**: PNG 透明背景效果不佳，尝试改用 SVG 矢量格式作为替代输出
 - **修订历史**:
   - v1.0: 初始版本
   - v1.1: 对齐现有代码结构、补齐兼容/安全/测试闭环
   - v1.2: 补充依赖声明、明确文本换行策略、完善 LLM API 适配代码、明确 both 模式定义
+  - v1.3: 补充 GitHub 追踪信息；明确与现有 `paper2slides/main.py`、`paper2slides/core/stages/generate_stage.py` 的对齐点；补齐 SVG→PNG 依赖可行性说明与可测试落地方案
 
 ## 0. 目标与范围
 
@@ -20,6 +26,12 @@
 - 任意缩放不失真（矢量）
 - 在“纯矢量为主”场景下文件体积更小（但嵌入大图片时可能更大）
 - Office 2016+ 可用（需限制在 PPT 支持的 SVG 子集）
+
+### 0.1.1 与现有“透明背景 PNG 改进方案”的关系
+
+仓库已有 `docs/transparent_background_improvement_design.md`，其方向是“继续产出 PNG，但尽可能让 alpha 真实、去掉浅色面板作为兜底”。本 SVG 方案属于**替代/补充输出链路**：
+- **适合**：文字/形状/简单图表为主、用户希望导入 PPT 后可无限缩放、且可接受“PPT 支持的 SVG 子集”限制。
+- **不适合**：大量照片/复杂渐变/滤镜效果、或者必须依赖 `slides.pdf` 且不希望引入 SVG→PNG 栅格化依赖的场景。
 
 ### 0.2 PNG 方案的问题
 
@@ -56,7 +68,20 @@
 
 1. **模型返回形式**：SVG 以“文本”返回（推荐），而不是依赖模型直接返回 `image/svg+xml`（不同 provider 能力不一致）。
 2. **输出闭环**：若输出为 `.svg`，是否同时导出 `.png`（用于 `slides.pdf` 以及旧链路兼容）必须在配置与 CLI 中定义；否则需要显式关闭/跳过 PDF 合成。
-3. **OpenRouter/Google 差异**：当前 OpenRouter 路径只从 `message.images` 取图像数据；要支持 SVG 文本，需要新增“从 `message.content` 取文本”的解析分支（或新建文本调用函数）。
+3. **Stage 保存逻辑**：当前 `paper2slides/core/stages/generate_stage.py` 通过 `save_callback` 边生成边落盘，并基于 `mime_type→ext` 做扩展名映射；要支持 `.svg`，需要：
+   - 将 `image/svg+xml` 映射到 `.svg`；
+   - 若 `slides` 模式仍需 `slides.pdf`，必须保证参与 `save_images_as_pdf()` 的是位图（例如由 SVG 栅格化得到的 PNG），否则 PDF 合成会失败。
+4. **OpenRouter/Google 差异**：当前 OpenRouter 路径只从 `message.images` 取图像数据；要支持 SVG 文本，需要新增“从 `message.content` 取文本”的解析分支（或新建文本调用函数）。
+
+### 1.1.2 模型与 Provider 配置策略（建议明确）
+
+SVG 生成本质是“文本生成”（可能带参考图），与当前“图像生成”链路使用的 `IMAGE_GEN_*` 环境变量耦合较强。为避免互相干扰，建议在实现中引入独立配置（可先用环境变量，后续再下沉到 `GenerationConfig`）：
+- `SVG_GEN_PROVIDER`（默认沿用 `IMAGE_GEN_PROVIDER`）
+- `SVG_GEN_API_KEY` / `SVG_GEN_BASE_URL`（默认沿用 `IMAGE_GEN_API_KEY` / `IMAGE_GEN_BASE_URL`）
+- `SVG_GEN_MODEL`（默认可沿用 `LLM_MODEL` 或单独指定）
+- `SVG_GEN_MAX_TOKENS`（默认 6000~10000，视模型上下文而定）
+
+这样可以做到：PNG 仍走“图像模型”，SVG 走“文本模型”，避免因为全局 `IMAGE_GEN_RESPONSE_MIME_TYPE` 切换而影响现有 PNG 行为。
 
 ### 1.2 核心流程
 
@@ -86,7 +111,8 @@ CRITICAL REQUIREMENT - Generate SVG Code:
 
 1. OUTPUT FORMAT:
    - Output valid SVG code (XML format)
-   - Use viewBox for responsive sizing (e.g., viewBox="0 0 1920 1080")
+   - Use viewBox for sizing (e.g., viewBox="0 0 1920 1080")
+   - For PPT import stability, also set width/height to match the viewBox (e.g., width="1920" height="1080")
    - NO background rectangle - transparent by default
    - Use UTF-8 encoding with proper XML declaration
    - Keep to a PPT-safe SVG subset (PowerPoint supports only part of SVG)
@@ -196,6 +222,9 @@ def validate_and_clean_svg(svg_code: str) -> str:
         svg_code = svg_code[svg_code.find("<svg"): svg_code.rfind("</svg>") + len("</svg>")]
 
     # 2) XML 解析
+    # 安全兜底：拒绝 DTD/ENTITY（防止 XML 实体膨胀类 DoS），实现时可：
+    # - 直接在解析前检测并拒绝包含 <!DOCTYPE / <!ENTITY 的输入
+    # - 或引入 defusedxml 作为依赖（更稳健）
     try:
         root = ET.fromstring(svg_code.strip())
     except ET.ParseError as e:
@@ -218,7 +247,11 @@ def validate_and_clean_svg(svg_code: str) -> str:
         root.attrib["viewBox"] = f"0 0 {width} {height}"
 
     # 5) 安全净化（示意）：移除脚本/外链/事件属性/foreignObject
-    # 实现建议：tag 白名单 + 属性白名单；对 <image> 仅允许 data: URI。
+    # 实现建议（需要落地到可测试的确定性规则）：
+    # - tag 白名单 + 属性白名单（按 tag 分组更精细）
+    # - 统一移除事件属性（onload/onclick/...）
+    # - 对 <image> 仅允许 data: URI，且限制 mimeType（image/png|image/jpeg）与体积上限
+    # - 对 path/points 等长字符串设置长度上限，避免极端输入导致内存/性能问题
 
     # 6) 移除“全画布背景 rect”（必须支持嵌套删除）
     parent_map = {c: p for p in root.iter() for c in p}
@@ -248,13 +281,13 @@ def validate_and_clean_svg(svg_code: str) -> str:
 
 **依赖要求：**
 
-需要在 `requirements.txt` 中添加以下依赖之一：
+需要在 `requirements.txt` 中添加以下依赖之一（两者都可能带来“平台/系统库”差异，必须在实现与 CI 中验证）：
 
 ```python
-# 方案1：cairosvg（推荐，渲染质量更好）
+# 方案1：cairosvg（渲染质量好；但在部分环境可能依赖系统 cairo 库）
 cairosvg>=2.7.0
 
-# 方案2：svglib（备选，纯 Python 实现）
+# 方案2：svglib（备选；常见依赖包括 lxml/reportlab，通常有 wheels 但仍需验证环境）
 svglib>=1.5.0
 ```
 
@@ -360,6 +393,8 @@ class GenerationConfig:
     svg_viewbox_height: int = 1080
 ```
 
+> 评审补充：当前 `GenerationConfig.to_dict()` 仅序列化了少量字段；若后续有任何模块依赖 `GenerationInput.to_dict()`（例如用于调试/记录），需要同步把新增字段（以及透明背景高级选项）纳入 `to_dict()`，以免“配置在日志/检查点中丢失”造成排障困难。
+
 #### 文件2: `paper2slides/generator/image_generator.py`
 
 **修改点1**: 添加 SVG 生成与清理（文本返回）
@@ -378,6 +413,9 @@ def _generate_svg_bytes(self, prompt: str, reference_images: list[dict]) -> tupl
 
 - 在 `_generate_poster()` / `_generate_slides()` 内，根据 `config.output_format` 分支调用 `_generate_svg_bytes()`（SVG）或现有 `_call_model()`（PNG/JPEG/WEBP）。
 - 对 slides 的并行路径（ThreadPoolExecutor）同样需要按 `output_format` 分支，保证行为一致。
+- 评审补充（slides 一致性）：当前代码会把“第 2 张 slide”作为 `style_ref_image`（base64 位图）注入后续 slide 生成提示以维持风格一致性。若切换为 SVG 文本生成，需明确二选一：
+  - **继续使用位图参考**：对第 2 张 SVG 先栅格化出 PNG，再作为 `style_ref_image` 传入后续生成（实现简单、但引入 SVG→PNG 依赖与额外耗时）。
+  - **改为文本参考**：将第 2 张的“SVG 片段/配色/字体定义”抽取为文本约束（更轻量，但需要更强提示词设计与稳定性验证）。
 
 **修改点3**: `both` 与 `slides.pdf` 的闭环建议放在 `generate_stage.py`
 
@@ -442,21 +480,26 @@ def _call_model_for_text(self, prompt: str, reference_images: list[dict]) -> str
 ```python
 def _call_openrouter_for_text(self, prompt: str, reference_images: list[dict]) -> str:
     """OpenRouter 文本生成（用于 SVG）"""
-    # 构建消息（参考图片仍使用 image_url）
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": prompt},
-            *[{"type": "image_url", "image_url": {"url": img["url"]}}
-              for img in reference_images]
-        ]
-    }]
+    # 构建消息：与现有 `_call_model_openrouter()` 的 reference_images 结构对齐（base64 + mime_type）
+    content = [{"type": "text", "text": prompt}]
+    for img in reference_images:
+        if img.get("base64") and img.get("mime_type"):
+            fig_id = img.get("figure_id", "Figure")
+            caption = img.get("caption", "")
+            label = f"[{fig_id}]: {caption}" if caption else f"[{fig_id}]"
+            content.append({"type": "text", "text": label})
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{img['mime_type']};base64,{img['base64']}"}
+            })
 
     # 调用 API（不设置 IMAGE_GEN_RESPONSE_MIME_TYPE，使用默认文本响应）
     response = self.client.chat.completions.create(
         model=self.model,
-        messages=messages,
+        messages=[{"role": "user", "content": content}],
         max_tokens=8000,  # SVG 代码可能较长
+        # 说明：是否需要 `extra_body={"modalities":["text"]}` 取决于 OpenRouter/模型；
+        # 实现时可与现有 `_call_model_openrouter()` 一致，并通过配置开关控制。
     )
 
     # 从 message.content 读取文本
@@ -468,35 +511,38 @@ def _call_openrouter_for_text(self, prompt: str, reference_images: list[dict]) -
 ```python
 def _call_google_for_text(self, prompt: str, reference_images: list[dict]) -> str:
     """Google Gemini 文本生成（用于 SVG）"""
-    import google.generativeai as genai
+    # 评审建议：为减少新增依赖，优先复用仓库现有的 `requests` 调用方式（见 `_call_model_google()`）
+    # 核心差异：generationConfig.responseMimeType = "text/plain"，并从 parts[].text 读取输出。
+    model_name = self.model if self.model.startswith("models/") else f"models/{self.model}"
+    url = f"{self.google_api_base_url}/{model_name}:generateContent"
 
-    # 配置 API
-    genai.configure(
-        api_key=os.getenv("IMAGE_GEN_API_KEY"),
-        transport="rest",
-        client_options={"api_endpoint": os.getenv("GOOGLE_GENAI_BASE_URL")}
-    )
-
-    model = genai.GenerativeModel(
-        model_name=self.model,
-        generation_config={
-            "response_mime_type": "text/plain",  # 明确要求文本输出
-            "max_output_tokens": 8000,
-        }
-    )
-
-    # 构建内容（参考图片使用 PIL.Image）
-    contents = [prompt]
+    parts = [{"text": prompt}]
     for img in reference_images:
-        # 假设 img["path"] 是本地路径
-        from PIL import Image
-        contents.append(Image.open(img["path"]))
+        if img.get("base64") and img.get("mime_type"):
+            fig_id = img.get("figure_id", "Figure")
+            caption = img.get("caption", "")
+            label = f"[{fig_id}]: {caption}" if caption else f"[{fig_id}]"
+            parts.append({"text": label})
+            parts.append({
+                "inlineData": {
+                    "mimeType": img["mime_type"],
+                    "data": img["base64"],
+                }
+            })
 
-    # 生成
-    response = model.generate_content(contents)
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "responseMimeType": "text/plain",
+            "maxOutputTokens": 8000,
+        },
+    }
 
-    # 从 candidates[0].content.parts[].text 拼接
-    return "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, "text"))
+    resp = requests.post(url, params={"key": self.api_key}, json=payload, timeout=120)
+    resp.raise_for_status()
+    data = resp.json()
+    parts_out = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts_out)
 ```
 
 **关键点：**
@@ -510,17 +556,21 @@ def _call_google_for_text(self, prompt: str, reference_images: list[dict]) -> st
 
 **generate_stage.py 修改要点：**
 
+评审补充：当前 `paper2slides/core/stages/generate_stage.py` 采用“生成时 save_callback 立即落盘”的写法；实现 SVG 后有两种落地路径，建议二选一并写死（避免行为分叉导致难测）：
+1. **保留 save_callback（推荐最小改动）**：在 callback 内识别 `image/svg+xml`，写 `.svg`；若需要 PDF，则在 callback 或生成后阶段同步/异步栅格化出 `.png`，并将 PNG 列表用于 `save_images_as_pdf()`。
+2. **取消 save_callback、统一 stage 落盘**：`ImageGenerator.generate()` 只返回内存结果，由 stage 统一保存（更清晰但改动面更大）。
+
 ```python
 async def run_generate_stage(base_dir: Path, config_dir: Path, config: Dict) -> Dict:
     # ... 现有代码 ...
 
-    # 生成图像
-    images = generator.generate(gen_input, plan)
+    # 生成图像（注意：当前实现签名为 generator.generate(plan, gen_input, ...)）
+    images = generator.generate(plan, gen_input, max_workers=config.get("max_workers", 1))
 
     # 保存图像并处理 SVG
     output_dir = get_output_dir(config_dir)
     saved_files = []
-    png_files_for_pdf = []  # 用于生成 PDF 的 PNG 文件
+    images_for_pdf = []  # 用于生成 PDF 的位图（GeneratedImage）
 
     for img in images:
         if img.mime_type == "image/svg+xml":
@@ -538,7 +588,11 @@ async def run_generate_stage(base_dir: Path, config_dir: Path, config: Dict) -> 
                     width=config.get("svg_viewbox_width", 1920),
                     height=config.get("svg_viewbox_height", 1080)
                 )
-                png_files_for_pdf.append(png_path)
+                images_for_pdf.append(GeneratedImage(
+                    section_id=img.section_id,
+                    image_data=png_path.read_bytes(),
+                    mime_type="image/png",
+                ))
             elif config.get("output_type") == "slides":
                 # 警告：slides 模式下没有 PNG，无法生成 PDF
                 logger.warning(
@@ -551,15 +605,17 @@ async def run_generate_stage(base_dir: Path, config_dir: Path, config: Dict) -> 
             img_path = output_dir / f"{img.section_id}{ext}"
             img_path.write_bytes(img.image_data)
             saved_files.append(img_path)
-            png_files_for_pdf.append(img_path)
+            images_for_pdf.append(img)
 
     # 生成 PDF（仅 slides 模式且有 PNG 文件）
-    if config.get("output_type") == "slides" and png_files_for_pdf:
+    if config.get("output_type") == "slides" and images_for_pdf:
         pdf_path = output_dir / "slides.pdf"
-        save_images_as_pdf(png_files_for_pdf, pdf_path)
+        save_images_as_pdf(images_for_pdf, str(pdf_path))
 
     return {"saved_files": [str(f) for f in saved_files]}
 ```
+
+> 评审补充：`save_images_as_pdf()` 会把 RGBA 转成 RGB（PDF 不支持 alpha），默认会把透明区域“压到黑色/深色底”。如果希望 `slides.pdf` 作为更接近 PPT 观感的预览，建议在实现中把 RGBA 先合成到白底（或可配置底色）再转 RGB。
 
 **行为总结：**
 
@@ -662,8 +718,11 @@ async def generate_endpoint(request: GenerateRequest):
 | LLM 生成无效 SVG | 高 | 中 | 严格验证 + 自动修复 + 降级到 PNG |
 | 复杂图表难以生成 | 中 | 高 | 提供图表模板 + 混合模式（图表用图片嵌入） |
 | 字体兼容性问题 | 中 | 中 | 使用 web-safe 字体 + 字体嵌入 |
+| PPT 渲染差异（尤其 `<text>` 的描边/换行/基线） | 中 | 中 | 约束子集（少用 stroke/filter/基线属性）；必要时将关键文字转路径（牺牲可编辑性） |
+| `<image>` base64 在 PPT 中兼容性不确定 | 中 | 中 | 默认禁用或严格限制 `<image>`；复杂图表降级为 PNG 并作为独立资产输出 |
 | 旧版 Office 不支持 | 低 | 低 | 同时导出 PNG 备份 |
 | SVG 安全与渲染风险（Web/浏览器） | 中 | 中 | 生成后做安全净化（移除脚本/外链/事件/foreignObject），再提供下载/预览 |
+| SVG→PNG 栅格化依赖不稳定（cairo/lxml/平台差异） | 中 | 中 | 将 SVG→PNG 设为可选依赖；在 CI/发布环境验证；失败时允许跳过 PDF 或降级 PNG 直出 |
 
 ### 4.2 实施风险
 
@@ -793,16 +852,34 @@ def _generate_png_fallback(self, prompt: str, reference_images: list[dict]) -> t
 
 ### 5.3 测试建议（最小可行）
 
-单元测试（无需真实调用外部模型，可用固定样例字符串）：
+单元测试（无需真实调用外部模型，可用固定样例字符串；建议优先用标准库 `unittest`，避免引入额外测试依赖）：
 1. `validate_and_clean_svg()`：
    - markdown 代码块/前后噪声提取
    - 带/不带 xmlns 的 `<svg>`
    - 背景 `<rect>` 在根节点与嵌套 `<g>` 两种情况均可移除
    - 禁止元素与属性（`<script>`、`onload`、外链 `href="http..."`）被移除/拒绝
+   - 拒绝 `<!DOCTYPE` / `<!ENTITY`（防止实体膨胀/DoS）
+   - `<image>` 仅允许 `data:` 且 mimeType 白名单与体积上限生效
 2. SVG→PNG（若启用）：对给定 SVG 样例栅格化输出 PNG，并检查 alpha 存在（背景透明）。
+
+建议的落地方式：
+- 新增 `tests/test_svg_sanitize.py`：覆盖 `validate_and_clean_svg()` 的提取/净化/背景移除/安全拒绝用例。
+- 新增 `tests/test_svg_to_png.py`：若 `cairosvg`/`svglib` 不可用则跳过；可用时输出 1 张小 PNG 并断言 alpha 通道存在。
+- 运行命令：`python -m unittest discover -s tests`
 
 端到端测试（建议保留最小人工验收步骤）：
 - slides 模式：生成 `.svg` + `.png`，确认 `slides.pdf` 成功生成；导入 PowerPoint 验收（不同模板浅色/深色背景）。
+
+## 8. 评审结论与实施前决策点
+
+**结论**：方案整体方向正确且可行；在当前仓库结构下可以按本文档落地编码。为保证“可实现、可验证、可回滚”，实现前需把关键决策点写死，并把净化/落盘/降级路径做成可单测的确定性逻辑。
+
+**必须先定的决策点（不建议实现时再临时决定）**：
+1. `generate_stage.py` 落盘方式：保留 `save_callback` 还是改为 stage 统一落盘（见 2.5）。
+2. SVG 文本生成的配置来源：复用 `IMAGE_GEN_*` 还是引入 `SVG_GEN_*`（见 1.1.2）。
+3. slides 一致性：`style_ref_image` 继续用位图参考还是改为文本参考（见 2.3 修改点2）。
+4. SVG→PNG 栅格化选型：`cairosvg` / `svglib` / 其他（并在目标运行环境验证依赖可用性）。
+5. `slides.pdf` 预览底色：透明 PNG 在 PDF 中是合成白底还是黑底（见 2.5 评审补充）。
 
 ## 6. 后续优化
 
@@ -833,10 +910,10 @@ def _generate_png_fallback(self, prompt: str, reference_images: list[dict]) -> t
 
 ### 7.2 SVG 最佳实践
 
-1. **使用 viewBox 而非固定尺寸**
+1. **同时设置 viewBox + width/height（PPT 导入更稳定）**
    ```xml
-   <svg viewBox="0 0 1920 1080">  <!-- 推荐 -->
-   <svg width="1920" height="1080">  <!-- 不推荐 -->
+   <svg width="1920" height="1080" viewBox="0 0 1920 1080">  <!-- 推荐（PPT/浏览器都稳定） -->
+   <svg viewBox="0 0 1920 1080">  <!-- 备选：浏览器通常没问题，但某些软件默认尺寸不可控 -->
    ```
 
 2. **文字描边提高可读性**
