@@ -39,6 +39,12 @@ def get_config_name(config: Dict) -> str:
     if config.get("transparent_bg"):
         suffix += "_tbg"
 
+    output_format = config.get("output_format", "png")
+    if output_format and output_format != "png":
+        suffix += f"_{output_format}"
+        if not config.get("svg_export_png", True):
+            suffix += "_nopng"
+
     return f"{output_type}_{style}_{param}{suffix}"
 
 

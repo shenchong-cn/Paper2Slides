@@ -65,6 +65,14 @@ def main():
     parser.add_argument("--transparent-bg", action="store_true",
                         help="Generate images with transparent background (PNG format)")
 
+    # SVG output options
+    parser.add_argument("--format", choices=["png", "svg", "both"], default="png",
+                        help="Output image format (default: png)")
+    parser.add_argument("--no-png-export", action="store_true",
+                        help="When using SVG output, do not export PNG (disables slides.pdf)")
+    parser.add_argument("--viewbox", type=str, default="1920x1080",
+                        help="SVG viewBox size, e.g. 1920x1080 (default: 1920x1080)")
+
     # Transparent background advanced options
     parser.add_argument("--keep-light-panel", action="store_true",
                         help="Keep light panel (disable cleanup fallback)")
@@ -108,6 +116,14 @@ def main():
     
     # Build config
     style_type, custom_style = parse_style(args.style)
+    try:
+        vb_w_str, vb_h_str = args.viewbox.lower().split("x", 1)
+        svg_viewbox_width = int(vb_w_str)
+        svg_viewbox_height = int(vb_h_str)
+    except Exception:
+        logger.error(f"Invalid --viewbox value: {args.viewbox!r} (expected like 1920x1080)")
+        return
+
     config = {
         "input_path": input_path,
         "content_type": args.content,
@@ -119,6 +135,10 @@ def main():
         "fast_mode": args.fast,
         "max_workers": args.parallel if args.parallel else 1,
         "transparent_bg": args.transparent_bg,
+        "output_format": args.format,
+        "svg_export_png": (not args.no_png_export) if args.format != "both" else True,
+        "svg_viewbox_width": svg_viewbox_width,
+        "svg_viewbox_height": svg_viewbox_height,
         # Transparent background advanced options
         "cleanup_light_panel": not args.keep_light_panel,
         "panel_detect_luma": args.panel_luma,

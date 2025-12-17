@@ -16,9 +16,15 @@ import requests
 from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .config import GenerationInput
+from .config import GenerationInput, OutputFormat
 from ..utils.api_client import create_custom_client
 from .content_planner import ContentPlan, Section
+from ..utils.svg_utils import (
+    SvgSanitizeOptions,
+    SvgValidationError,
+    validate_and_clean_svg,
+    svg_to_png_bytes,
+)
 from ..prompts.image_generation import (
     STYLE_PROCESS_PROMPT,
     FORMAT_POSTER,
@@ -35,6 +41,7 @@ from ..prompts.image_generation import (
     SLIDE_FIGURE_HINT,
     POSTER_FIGURE_HINT,
 )
+from ..prompts.svg_generation import build_svg_generation_prompt
 
 
 @dataclass
@@ -161,7 +168,16 @@ class ImageGenerator:
         figure_images = self._load_figure_images(plan, gen_input.origin.base_path)
         style_name = gen_input.config.style.value
         custom_style = gen_input.config.custom_style
-        transparent_bg = gen_input.config.transparent_bg
+        output_format = getattr(gen_input.config, "output_format", OutputFormat.PNG)
+        if isinstance(output_format, str):
+            output_format = OutputFormat(output_format)
+
+        transparent_bg = bool(getattr(gen_input.config, "transparent_bg", False))
+        if transparent_bg and output_format != OutputFormat.PNG:
+            logging.getLogger(__name__).warning(
+                "transparent_bg is only supported in PNG mode; ignoring for SVG output"
+            )
+            transparent_bg = False
         
         # Process custom style with LLM if needed
         processed_style = None
@@ -174,29 +190,69 @@ class ImageGenerator:
         all_images = self._filter_images(plan.sections, figure_images)
         
         if plan.output_type == "poster":
-            result = self._generate_poster(style_name, processed_style, all_sections_md, all_images, transparent_bg)
+            result = self._generate_poster(
+                style_name,
+                processed_style,
+                all_sections_md,
+                all_images,
+                output_format,
+                transparent_bg,
+            )
             if save_callback and result:
                 save_callback(result[0], 0, 1)
             return result
         else:
-            return self._generate_slides(plan, style_name, processed_style, all_sections_md, figure_images, max_workers, save_callback, transparent_bg)
+            return self._generate_slides(
+                plan,
+                style_name,
+                processed_style,
+                all_sections_md,
+                figure_images,
+                max_workers,
+                save_callback,
+                output_format,
+                transparent_bg,
+            )
     
-    def _generate_poster(self, style_name, processed_style: Optional[ProcessedStyle], sections_md, images, transparent_bg: bool = False) -> List[GeneratedImage]:
+    def _generate_poster(
+        self,
+        style_name,
+        processed_style: Optional[ProcessedStyle],
+        sections_md,
+        images,
+        output_format: OutputFormat,
+        transparent_bg: bool = False,
+    ) -> List[GeneratedImage]:
         """Generate 1 poster image."""
         prompt = self._build_poster_prompt(
             format_prefix=FORMAT_POSTER,
             style_name=style_name,
             processed_style=processed_style,
             sections_md=sections_md,
-            transparent_bg=transparent_bg,
+            transparent_bg=transparent_bg if output_format == OutputFormat.PNG else False,
         )
-        
+
+        if output_format in {OutputFormat.SVG, OutputFormat.BOTH}:
+            svg_data, mime_type = self._generate_svg_bytes(prompt, images, strict=(output_format == OutputFormat.BOTH))
+            return [GeneratedImage(section_id="poster", image_data=svg_data, mime_type=mime_type)]
+
         image_data, mime_type = self._call_model(prompt, images)
         if transparent_bg:
             image_data, mime_type = self._to_transparent_png(image_data, mime_type)
         return [GeneratedImage(section_id="poster", image_data=image_data, mime_type=mime_type)]
     
-    def _generate_slides(self, plan, style_name, processed_style: Optional[ProcessedStyle], all_sections_md, figure_images, max_workers: int, save_callback=None, transparent_bg: bool = False) -> List[GeneratedImage]:
+    def _generate_slides(
+        self,
+        plan,
+        style_name,
+        processed_style: Optional[ProcessedStyle],
+        all_sections_md,
+        figure_images,
+        max_workers: int,
+        save_callback=None,
+        output_format: OutputFormat = OutputFormat.PNG,
+        transparent_bg: bool = False,
+    ) -> List[GeneratedImage]:
         """Generate N slide images (slides 1-2 sequential, 3+ parallel)."""
         results = []
         total = len(plan.sections)
@@ -210,6 +266,7 @@ class ImageGenerator:
             layouts = SLIDE_LAYOUTS_ACADEMIC
         
         style_ref_image = None  # Store 2nd slide as reference for all subsequent slides
+        svg_style_ref_size = (1024, 576)  # bitmap style reference for SVG mode
         
         # Generate first 2 slides sequentially (slide 1: no ref, slide 2: becomes ref)
         for i in range(min(2, total)):
@@ -224,7 +281,7 @@ class ImageGenerator:
                 layout_rule=layout_rule,
                 slide_info=f"Slide {i+1} of {total}",
                 context_md=all_sections_md,
-                transparent_bg=transparent_bg,
+                transparent_bg=transparent_bg if output_format == OutputFormat.PNG else False,
             )
             
             section_images = self._filter_images([section], figure_images)
@@ -232,19 +289,46 @@ class ImageGenerator:
             if style_ref_image:
                 reference_images.append(style_ref_image)
             reference_images.extend(section_images)
-            
-            image_data, mime_type = self._call_model(prompt, reference_images)
-            if transparent_bg:
-                image_data, mime_type = self._to_transparent_png(image_data, mime_type)
+
+            if output_format in {OutputFormat.SVG, OutputFormat.BOTH}:
+                image_data, mime_type = self._generate_svg_bytes(
+                    prompt,
+                    reference_images,
+                    strict=(output_format == OutputFormat.BOTH),
+                )
+            else:
+                image_data, mime_type = self._call_model(prompt, reference_images)
+                if transparent_bg:
+                    image_data, mime_type = self._to_transparent_png(image_data, mime_type)
             
             # Save 2nd slide (i=1) as style reference
             if i == 1:
-                style_ref_image = {
-                    "figure_id": "Reference Slide",
-                    "caption": "STRICTLY MAINTAIN: same background color, same accent color, same font style, same chart/icon style. Keep visual consistency.",
-                    "base64": base64.b64encode(image_data).decode("utf-8"),
-                    "mime_type": mime_type,
-                }
+                if mime_type == "image/svg+xml":
+                    try:
+                        png_bytes = svg_to_png_bytes(
+                            image_data,
+                            width=svg_style_ref_size[0],
+                            height=svg_style_ref_size[1],
+                            background_color=None,
+                        )
+                        style_ref_image = {
+                            "figure_id": "Reference Slide",
+                            "caption": "STRICTLY MAINTAIN: same background color, same accent color, same font style, same chart/icon style. Keep visual consistency.",
+                            "base64": base64.b64encode(png_bytes).decode("utf-8"),
+                            "mime_type": "image/png",
+                        }
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(
+                            f"Failed to rasterize SVG style reference; continuing without bitmap reference: {e}"
+                        )
+                        style_ref_image = None
+                else:
+                    style_ref_image = {
+                        "figure_id": "Reference Slide",
+                        "caption": "STRICTLY MAINTAIN: same background color, same accent color, same font style, same chart/icon style. Keep visual consistency.",
+                        "base64": base64.b64encode(image_data).decode("utf-8"),
+                        "mime_type": mime_type,
+                    }
             
             generated_img = GeneratedImage(section_id=section.id, image_data=image_data, mime_type=mime_type)
             results.append(generated_img)
@@ -274,10 +358,17 @@ class ImageGenerator:
                 section_images = self._filter_images([section], figure_images)
                 reference_images = [style_ref_image] if style_ref_image else []
                 reference_images.extend(section_images)
-                
-                image_data, mime_type = self._call_model(prompt, reference_images)
-                if transparent_bg:
-                    image_data, mime_type = self._to_transparent_png(image_data, mime_type)
+
+                if output_format in {OutputFormat.SVG, OutputFormat.BOTH}:
+                    image_data, mime_type = self._generate_svg_bytes(
+                        prompt,
+                        reference_images,
+                        strict=(output_format == OutputFormat.BOTH),
+                    )
+                else:
+                    image_data, mime_type = self._call_model(prompt, reference_images)
+                    if transparent_bg:
+                        image_data, mime_type = self._to_transparent_png(image_data, mime_type)
                 return i, GeneratedImage(section_id=section.id, image_data=image_data, mime_type=mime_type)
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -477,6 +568,108 @@ class ImageGenerator:
         if self.provider == "google":
             return self._call_model_google(prompt, reference_images)
         return self._call_model_openrouter(prompt, reference_images)
+
+    def _call_model_for_text(self, prompt: str, reference_images: List[dict], max_tokens: int) -> str:
+        """Call provider for text output (used for SVG generation)."""
+        provider = (self.provider or "").lower()
+        if provider == "google":
+            return self._call_text_google(prompt, reference_images, max_tokens=max_tokens)
+        if provider == "openrouter":
+            return self._call_text_openrouter(prompt, reference_images, max_tokens=max_tokens)
+        raise ValueError(f"Unsupported provider for text generation: {provider}")
+
+    def _call_text_openrouter(self, prompt: str, reference_images: List[dict], max_tokens: int) -> str:
+        content = [{"type": "text", "text": prompt}]
+        use_images = os.getenv("SVG_GEN_USE_REFERENCE_IMAGES", "true").lower() not in {"0", "false", "no"}
+        if use_images:
+            for img in reference_images:
+                if img.get("base64") and img.get("mime_type"):
+                    fig_id = img.get("figure_id", "Figure")
+                    caption = img.get("caption", "")
+                    label = f"[{fig_id}]: {caption}" if caption else f"[{fig_id}]"
+                    content.append({"type": "text", "text": label})
+                    content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{img['mime_type']};base64,{img['base64']}"},
+                        }
+                    )
+
+        model = os.getenv("SVG_GEN_MODEL") or self.model
+        response = self.client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            max_tokens=max_tokens,
+        )
+        msg = response.choices[0].message.content
+        if isinstance(msg, str):
+            return msg
+        if isinstance(msg, list):
+            parts = []
+            for part in msg:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+            return "\n".join(parts)
+        return str(msg or "")
+
+    def _call_text_google(self, prompt: str, reference_images: List[dict], max_tokens: int) -> str:
+        model = os.getenv("SVG_GEN_MODEL") or self.model
+        model_name = model if str(model).startswith("models/") else f"models/{model}"
+        url = f"{self.google_api_base_url}/{model_name}:generateContent"
+
+        parts = [{"text": prompt}]
+        use_images = os.getenv("SVG_GEN_USE_REFERENCE_IMAGES", "true").lower() not in {"0", "false", "no"}
+        if use_images:
+            for img in reference_images:
+                if img.get("base64") and img.get("mime_type"):
+                    fig_id = img.get("figure_id", "Figure")
+                    caption = img.get("caption", "")
+                    label = f"[{fig_id}]: {caption}" if caption else f"[{fig_id}]"
+                    parts.append({"text": label})
+                    parts.append({"inlineData": {"mimeType": img["mime_type"], "data": img["base64"]}})
+
+        payload = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"responseMimeType": "text/plain", "maxOutputTokens": max_tokens},
+        }
+        response = requests.post(url, params={"key": self.api_key}, json=payload, timeout=120)
+        response.raise_for_status()
+        data = response.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise RuntimeError("Google API response has no candidates (text)")
+        out_parts = candidates[0].get("content", {}).get("parts", [])
+        return "".join(p.get("text", "") for p in out_parts)
+
+    def _generate_svg_bytes(self, prompt: str, reference_images: List[dict], strict: bool = False) -> tuple[bytes, str]:
+        """
+        Generate SVG bytes via text model, validate & sanitize, and return as UTF-8 bytes.
+
+        If strict=False, may fall back to PNG output when SVG generation fails.
+        """
+        logger = logging.getLogger(__name__)
+        view_w = int(getattr(self.config, "svg_viewbox_width", 1920))
+        view_h = int(getattr(self.config, "svg_viewbox_height", 1080))
+        max_tokens = int(os.getenv("SVG_GEN_MAX_TOKENS", "8000"))
+
+        full_prompt = f"{prompt}\n\n{build_svg_generation_prompt(view_w, view_h)}"
+        try:
+            svg_text = self._call_model_for_text(full_prompt, reference_images, max_tokens=max_tokens)
+            cleaned = validate_and_clean_svg(
+                svg_text,
+                options=SvgSanitizeOptions(viewbox_width=view_w, viewbox_height=view_h, allow_images=True),
+            )
+            return cleaned.encode("utf-8"), "image/svg+xml"
+        except (SvgValidationError, ValueError) as e:
+            if strict:
+                raise
+            logger.warning(f"SVG validation failed; falling back to PNG: {e}")
+            return self._call_model(prompt, reference_images)
+        except Exception as e:
+            if strict:
+                raise
+            logger.warning(f"SVG generation failed; falling back to PNG: {e}")
+            return self._call_model(prompt, reference_images)
 
     def _to_transparent_png(self, image_data: bytes, mime_type: str) -> tuple[bytes, str]:
         """
@@ -1190,7 +1383,9 @@ def save_images_as_pdf(images: List[GeneratedImage], output_path: str):
 
         # Convert RGBA to RGB (PDF doesn't support alpha)
         if pil_img.mode == 'RGBA':
-            pil_img = pil_img.convert('RGB')
+            background = Image.new("RGB", pil_img.size, (255, 255, 255))
+            background.paste(pil_img, mask=pil_img.getchannel("A"))
+            pil_img = background
         elif pil_img.mode != 'RGB':
             pil_img = pil_img.convert('RGB')
 

@@ -8,6 +8,13 @@ from enum import Enum
 from paper2slides.summary import OriginalElements, PaperContent, GeneralContent
 
 
+class OutputFormat(str, Enum):
+    """Image output format for generation."""
+    PNG = "png"
+    SVG = "svg"
+    BOTH = "both"
+
+
 class OutputType(str, Enum):
     """Output type for generation."""
     POSTER = "poster"
@@ -70,6 +77,12 @@ class GenerationConfig:
     # Generation options
     transparent_bg: bool = False
 
+    # Output format options (default keeps existing PNG behavior)
+    output_format: OutputFormat = OutputFormat.PNG
+    svg_export_png: bool = True
+    svg_viewbox_width: int = 1920
+    svg_viewbox_height: int = 1080
+
     # Transparent background advanced options
     cleanup_light_panel: bool = True  # 是否启用"浅色面板去除"兜底
     panel_detect_luma: int = 220  # 面板检测亮度阈值
@@ -90,6 +103,19 @@ class GenerationConfig:
             "slides_length": self.slides_length.value,
             "style": self.style.value,
             "custom_style": self.custom_style,
+            "transparent_bg": self.transparent_bg,
+            "output_format": self.output_format.value,
+            "svg_export_png": self.svg_export_png,
+            "svg_viewbox_width": self.svg_viewbox_width,
+            "svg_viewbox_height": self.svg_viewbox_height,
+            # Transparent background advanced options (for reproducibility/debugging)
+            "cleanup_light_panel": self.cleanup_light_panel,
+            "panel_detect_luma": self.panel_detect_luma,
+            "content_diff_threshold": self.content_diff_threshold,
+            "edge_expand": self.edge_expand,
+            "edge_blur": self.edge_blur,
+            "debug_save_intermediate": self.debug_save_intermediate,
+            "fallback_to_old_behavior": self.fallback_to_old_behavior,
         }
 
 

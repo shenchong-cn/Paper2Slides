@@ -15,9 +15,10 @@ async def run_generate_stage(base_dir: Path, config_dir: Path, config: Dict) -> 
     """Stage 4: Generate images."""
     from paper2slides.summary import PaperContent, GeneralContent, TableInfo, FigureInfo, OriginalElements
     from paper2slides.generator import GenerationConfig, GenerationInput
-    from paper2slides.generator.config import OutputType, PosterDensity, SlidesLength, StyleType
+    from paper2slides.generator.config import OutputType, PosterDensity, SlidesLength, StyleType, OutputFormat
     from paper2slides.generator.content_planner import ContentPlan, Section, TableRef, FigureRef
     from paper2slides.generator.image_generator import ImageGenerator, save_images_as_pdf
+    from paper2slides.utils.svg_utils import svg_to_png_bytes
     
     plan_data = load_json(get_plan_checkpoint(config_dir))
     summary_data = load_json(get_summary_checkpoint(base_dir, config))
@@ -68,14 +69,33 @@ async def run_generate_stage(base_dir: Path, config_dir: Path, config: Dict) -> 
         content = PaperContent(**summary_data["content"])
     else:
         content = GeneralContent(**summary_data["content"])
-    
+
+    output_format = config.get("output_format", "png")
+    try:
+        output_format_enum = OutputFormat(output_format)
+    except Exception:
+        raise ValueError(f"Invalid output_format: {output_format!r}")
+
+    svg_export_png = bool(config.get("svg_export_png", True))
+    if output_format_enum == OutputFormat.BOTH:
+        svg_export_png = True
+
+    transparent_bg = bool(config.get("transparent_bg", False))
+    if transparent_bg and output_format_enum != OutputFormat.PNG:
+        logger.warning("transparent_bg is only supported for output_format=png; ignoring")
+        transparent_bg = False
+
     gen_config = GenerationConfig(
         output_type=OutputType(config.get("output_type", "slides")),
         poster_density=PosterDensity(config.get("poster_density", "medium")),
         slides_length=SlidesLength(config.get("slides_length", "medium")),
         style=StyleType(config.get("style", "academic")),
         custom_style=config.get("custom_style"),
-        transparent_bg=config.get("transparent_bg", False),
+        transparent_bg=transparent_bg,
+        output_format=output_format_enum,
+        svg_export_png=svg_export_png,
+        svg_viewbox_width=int(config.get("svg_viewbox_width", 1920)),
+        svg_viewbox_height=int(config.get("svg_viewbox_height", 1080)),
         # Transparent background advanced options
         cleanup_light_panel=config.get("cleanup_light_panel", True),
         panel_detect_luma=config.get("panel_detect_luma", 220),
@@ -93,17 +113,18 @@ async def run_generate_stage(base_dir: Path, config_dir: Path, config: Dict) -> 
     output_subdir = get_output_dir(config_dir)
     output_subdir.mkdir(parents=True, exist_ok=True)
 
-    # Force PNG format for transparent background
-    transparent_bg = config.get("transparent_bg", False)
-    if transparent_bg:
-        ext_map = {"image/png": ".png"}  # Only PNG for transparency
-    else:
-        ext_map = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+    # Determine extension mapping
+    ext_map = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "image/svg+xml": ".svg",
+    }
 
     # Save callback: save each image immediately after generation
     def save_image_callback(img, index, total):
-        # Force PNG extension for transparent background
-        if transparent_bg:
+        # Force PNG extension for transparent background (PNG mode only)
+        if transparent_bg and output_format_enum == OutputFormat.PNG:
             ext = ".png"
         else:
             ext = ext_map.get(img.mime_type, ".png")
@@ -116,16 +137,36 @@ async def run_generate_stage(base_dir: Path, config_dir: Path, config: Dict) -> 
     max_workers = config.get("max_workers", 1)
     images = generator.generate(plan, gen_input, max_workers=max_workers, save_callback=save_image_callback)
     logger.info(f"  Generated {len(images)} images")
+
+    # If SVG output needs PNG export, rasterize SVG to PNG for PDF export / compatibility.
+    images_for_pdf = []
+    if output_format_enum in {OutputFormat.SVG, OutputFormat.BOTH} and svg_export_png:
+        w = int(config.get("svg_viewbox_width", 1920))
+        h = int(config.get("svg_viewbox_height", 1080))
+        for img in images:
+            if img.mime_type != "image/svg+xml":
+                images_for_pdf.append(img)
+                continue
+
+            png_bytes = svg_to_png_bytes(img.image_data, width=w, height=h, background_color=None)
+            png_path = output_subdir / f"{img.section_id}.png"
+            with open(png_path, "wb") as f:
+                f.write(png_bytes)
+            logger.info(f"  Saved: {png_path.name}")
+            images_for_pdf.append(type(img)(section_id=img.section_id, image_data=png_bytes, mime_type="image/png"))
+    else:
+        images_for_pdf = images
     
     # Generate PDF for slides
     output_type = config.get("output_type", "slides")
-    if output_type == "slides" and len(images) > 1:
+    if output_type == "slides" and output_format_enum in {OutputFormat.SVG, OutputFormat.BOTH} and not svg_export_png:
+        logger.warning("SVG output without PNG export: skipping slides.pdf generation")
+    elif output_type == "slides" and len(images_for_pdf) > 1:
         pdf_path = output_subdir / "slides.pdf"
-        save_images_as_pdf(images, str(pdf_path))
+        save_images_as_pdf(images_for_pdf, str(pdf_path))
         logger.info(f"  Saved: slides.pdf")
     
     logger.info("")
     logger.info(f"Output: {output_subdir}")
     
     return {"output_dir": str(output_subdir), "num_images": len(images)}
-

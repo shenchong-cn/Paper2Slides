@@ -152,6 +152,9 @@ async def chat(
     length: Optional[str] = Form(None),  # 'short', 'medium', 'long' (for slides)
     density: Optional[str] = Form(None),  # 'sparse', 'medium', 'dense' (for poster)
     fast_mode: Optional[str] = Form(None),  # 'true' or 'false' - fast mode for paper content
+    output_format: str = Form("png"),  # 'png' | 'svg' | 'both'
+    svg_export_png: Optional[str] = Form(None),  # 'true' | 'false' (only for SVG output)
+    svg_viewbox: str = Form("1920x1080"),
     session_id: Optional[str] = Form(None),  # Existing session ID to reuse files
     files: List[UploadFile] = File([])
 ):
@@ -233,8 +236,27 @@ async def chat(
                     })
                     print(f"Saved file: {file_path}")
         
+        def _parse_bool(value: Optional[str], default: bool) -> bool:
+            if value is None:
+                return default
+            return value.lower() in {"1", "true", "yes", "y", "on"}
+
         # Parse fast_mode from string to boolean
         fast_mode_bool = fast_mode and fast_mode.lower() == 'true'
+
+        # Parse SVG options
+        output_format = (output_format or "png").lower()
+        if output_format not in {"png", "svg", "both"}:
+            raise HTTPException(status_code=400, detail=f"Invalid output_format: {output_format!r}")
+        svg_export_png_bool = _parse_bool(svg_export_png, default=True)
+        if output_format == "both":
+            svg_export_png_bool = True
+        try:
+            vb_w_str, vb_h_str = svg_viewbox.lower().split("x", 1)
+            svg_viewbox_width = int(vb_w_str)
+            svg_viewbox_height = int(vb_h_str)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid svg_viewbox: {svg_viewbox!r} (expected 1920x1080)")
         
         # Log received request
         print(f"\n{'='*60}")
@@ -280,6 +302,10 @@ async def chat(
             length,
             density,
             fast_mode_bool,
+            output_format,
+            svg_export_png_bool,
+            svg_viewbox_width,
+            svg_viewbox_height,
             session_manager  # Pass session manager to check for cancellation
         )
         
@@ -301,6 +327,10 @@ async def generate_slides_with_pipeline(
     length: Optional[str] = None,
     density: Optional[str] = None,
     fast_mode: bool = False,
+    output_format: str = "png",
+    svg_export_png: bool = True,
+    svg_viewbox_width: int = 1920,
+    svg_viewbox_height: int = 1080,
     session_manager: SessionManager = None
 ) -> dict:
     """
@@ -369,6 +399,10 @@ async def generate_slides_with_pipeline(
         "slides_length": length or "medium",
         "poster_density": density or "medium",
         "fast_mode": fast_mode if content == "paper" else False,  # Fast mode only for paper content
+        "output_format": output_format,
+        "svg_export_png": svg_export_png,
+        "svg_viewbox_width": svg_viewbox_width,
+        "svg_viewbox_height": svg_viewbox_height,
     }
     
     base_dir = get_base_dir(str(OUTPUT_DIR), project_name, content)
@@ -439,7 +473,9 @@ def _update_state_on_error(
     style: str,
     length: Optional[str],
     density: Optional[str],
-    fast_mode: bool
+    fast_mode: bool,
+    output_format: str = "png",
+    svg_export_png: bool = True,
 ):
     """Update state.json when background pipeline fails"""
     from paper2slides.core.state import load_state, save_state
@@ -469,6 +505,8 @@ def _update_state_on_error(
         "slides_length": length or "medium",
         "poster_density": density or "medium",
         "fast_mode": fast_mode if content == "paper" else False,
+        "output_format": output_format,
+        "svg_export_png": svg_export_png,
     }
     
     config_dir = get_config_dir(base_dir, config)
@@ -496,6 +534,10 @@ async def run_pipeline_background(
     length: Optional[str],
     density: Optional[str],
     fast_mode: bool = False,
+    output_format: str = "png",
+    svg_export_png: bool = True,
+    svg_viewbox_width: int = 1920,
+    svg_viewbox_height: int = 1080,
     session_manager: SessionManager = None
 ):
     """
@@ -514,7 +556,20 @@ async def run_pipeline_background(
         
         logger.info(f"Starting background pipeline for session {session_id[:8]}")
         result = await generate_slides_with_pipeline(
-            session_id, message, files, content, output_type, style, length, density, fast_mode, session_manager
+            session_id,
+            message,
+            files,
+            content,
+            output_type,
+            style,
+            length,
+            density,
+            fast_mode,
+            output_format,
+            svg_export_png,
+            svg_viewbox_width,
+            svg_viewbox_height,
+            session_manager,
         )
         
         # Check if cancelled after completion
@@ -538,7 +593,19 @@ async def run_pipeline_background(
         
         # Also update the state.json file to reflect the failure
         try:
-            _update_state_on_error(session_id, str(e), files, content, output_type, style, length, density, fast_mode)
+            _update_state_on_error(
+                session_id,
+                str(e),
+                files,
+                content,
+                output_type,
+                style,
+                length,
+                density,
+                fast_mode,
+                output_format,
+                svg_export_png,
+            )
         except Exception as state_err:
             logger.error(f"Failed to update state file: {state_err}")
     finally:
@@ -770,4 +837,3 @@ if __name__ == "__main__":
         limit_concurrency=10,    
         limit_max_requests=1000  
     )
-
