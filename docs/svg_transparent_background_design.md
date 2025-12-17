@@ -2,7 +2,7 @@
 
 ## 文档信息
 - **创建日期**: 2025-12-17
-- **版本**: v1.0
+- **版本**: v1.1（评审修订：对齐现有代码结构、补齐兼容/安全/测试闭环）
 - **作者**: Claude Code
 - **相关Issue**: PNG 透明背景效果不佳，改用 SVG 矢量格式
 
@@ -11,11 +11,11 @@
 ### 0.1 目标
 
 将图像生成从 PNG 位图格式改为 SVG 矢量格式，实现：
-- ✓ 真正的透明背景（无需后处理）
-- ✓ 完美的边缘质量（无锯齿、无白边）
-- ✓ 任意缩放不失真
-- ✓ 文件体积更小
-- ✓ 更好的 PPT 兼容性
+- 真正的透明背景（无需后处理去白底/去面板）
+- 更稳定的边缘质量（避免 PNG 抗锯齿白边）
+- 任意缩放不失真（矢量）
+- 在“纯矢量为主”场景下文件体积更小（但嵌入大图片时可能更大）
+- Office 2016+ 可用（需限制在 PPT 支持的 SVG 子集）
 
 ### 0.2 PNG 方案的问题
 
@@ -35,16 +35,24 @@
 | 缩放 | 失真 | 无损 |
 | 文件大小 | 较大 | 较小 |
 | 可编辑性 | 困难 | 容易 |
-| PPT 兼容性 | 一般 | 优秀 |
+| PPT 兼容性 | 一般 | 取决于 SVG 子集（可做到更好） |
 
 ## 1. 技术方案
 
 ### 1.1 方案概述
 
-采用 **LLM 直接生成 SVG 代码** 的方案：
+采用 **LLM 直接生成 SVG 代码（文本输出）** 的方案：
 1. 修改提示词，要求模型输出 SVG 代码而非图像
 2. 验证和清理 SVG 代码
 3. 可选：转换为 PNG 作为备份格式
+
+### 1.1.1 与当前仓库实现对齐（必须明确）
+
+当前仓库 `paper2slides/generator/image_generator.py` 的生成接口是“调用模型 → 返回二进制 image bytes + mime_type”，并在 `paper2slides/core/stages/generate_stage.py` 保存文件、在 slides 模式下合成 `slides.pdf`（仅支持位图）。因此 SVG 方案需要在设计上明确：
+
+1. **模型返回形式**：SVG 以“文本”返回（推荐），而不是依赖模型直接返回 `image/svg+xml`（不同 provider 能力不一致）。
+2. **输出闭环**：若输出为 `.svg`，是否同时导出 `.png`（用于 `slides.pdf` 以及旧链路兼容）必须在配置与 CLI 中定义；否则需要显式关闭/跳过 PDF 合成。
+3. **OpenRouter/Google 差异**：当前 OpenRouter 路径只从 `message.images` 取图像数据；要支持 SVG 文本，需要新增“从 `message.content` 取文本”的解析分支（或新建文本调用函数）。
 
 ### 1.2 核心流程
 
@@ -77,17 +85,20 @@ CRITICAL REQUIREMENT - Generate SVG Code:
    - Use viewBox for responsive sizing (e.g., viewBox="0 0 1920 1080")
    - NO background rectangle - transparent by default
    - Use UTF-8 encoding with proper XML declaration
+   - Keep to a PPT-safe SVG subset (PowerPoint supports only part of SVG)
 
 2. CONTENT RENDERING:
    - Use <text> elements for all text content
    - Use <rect>, <circle>, <path> for shapes and diagrams
-   - Use <image> for embedded images (base64 or external URLs)
+   - Use <image> ONLY when necessary, and ONLY as base64 data URI (no external URLs)
    - Use <g> for grouping related elements
-   - Apply proper styling via style attributes or <style> section
+   - Prefer inline presentation attributes (fill/stroke/font-size/...) over <style> to maximize PPT compatibility
 
 3. READABILITY STRATEGY:
    - Text with stroke for visibility: stroke="black" stroke-width="2" fill="white"
-   - Or use <filter> for drop shadows: <feDropShadow dx="2" dy="2" stdDeviation="3"/>
+   - Prefer “double text” outline instead of filters (more PPT-compatible):
+       1) outline text: fill="none" stroke="black" stroke-width="3"
+       2) main text: fill="white" stroke="none"
    - Use web-safe fonts or specify fallbacks: font-family="Arial, sans-serif"
    - Ensure sufficient contrast and font weight
 
@@ -96,17 +107,18 @@ CRITICAL REQUIREMENT - Generate SVG Code:
    <?xml version="1.0" encoding="UTF-8"?>
    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080">
      <defs>
-       <!-- Filters, gradients, patterns -->
+       <!-- Optional: gradients/patterns (avoid filters for PPT compatibility) -->
      </defs>
      <!-- Content elements -->
    </svg>
    ```
 
 5. WHAT TO AVOID:
-   - ❌ NO background <rect> filling the entire canvas
-   - ❌ NO raster image generation (this is SVG, not PNG)
-   - ❌ NO JavaScript or external dependencies
-   - ❌ NO invalid XML characters or unclosed tags
+   - NO background <rect> filling the entire canvas
+   - NO JavaScript, NO <script>, NO event handlers (onload/onclick/...)
+   - NO <foreignObject>, NO external CSS, NO external image links
+   - Avoid SVG filters (<filter>) and advanced features that PowerPoint may not render correctly
+   - NO invalid XML characters or unclosed tags
 
 6. EXAMPLE:
    ```xml
@@ -116,60 +128,115 @@ CRITICAL REQUIREMENT - Generate SVG Code:
        Title Text
      </text>
      <rect x="400" y="300" width="1120" height="600"
-           fill="#4A90E2" stroke="#2E5C8A" stroke-width="4" rx="10"/>
+           fill="none" stroke="#4A90E2" stroke-width="4" rx="10"/>
    </svg>
    ```
 """
 ```
 
+### 1.3.1 PPT 兼容子集约束（建议固化为白名单）
+
+PowerPoint 对 SVG 的支持是子集，设计上应“先收敛可用子集，再逐步放开”。建议在提示词与净化逻辑中同时约束：
+- **推荐保留**：`<svg>` `<g>` `<rect>` `<circle>` `<ellipse>` `<line>` `<polyline>` `<polygon>` `<path>` `<text>` `<tspan>`（以及少量 `<defs>`：`<linearGradient>` `<radialGradient>` `<stop>`，如确有需要）。
+- **建议禁用**：`<script>`、事件属性（`onload` 等）、`<foreignObject>`、外链资源（`href="http..."`）、`<filter>`/`<fe*>`、动画（SMIL）、外部 CSS。
+
+> 目标不是“SVG 能力最强”，而是“PPT 中渲染稳定、可预测”。
+
+### 1.3.2 文本换行与布局（必须可测试）
+
+SVG 的 `<text>` 默认不会像 HTML 一样自动换行；若不规定换行策略，长段落会溢出并导致不可控。
+
+建议策略（两者择一并在实现中定死）：
+1. **提示词强制换行**：要求模型对每个文本块输出 `<tspan>` 分行（给出最大行宽/最大行数规则）。
+2. **实现侧自动换行**：在生成后解析 SVG，对目标 `<text>` 节点进行“按空格/标点分词 + 近似宽度估算”的强制换行并重写为 `<tspan>`。
+
+无论采用哪种，都应提供可自动化测试的“确定性规则”（同一输入应生成同一行切分），否则难以回归。
+
 ### 1.4 SVG 验证和清理
 
 ```python
 def validate_and_clean_svg(svg_code: str) -> str:
-    """验证和清理 SVG 代码"""
-    import xml.etree.ElementTree as ET
-    import re
+    """
+    验证 + 清理 + 安全净化 SVG 代码（设计稿伪代码，需与实际实现对齐）
 
-    # 1. 提取 SVG 代码（如果 LLM 输出包含 markdown 代码块）
-    svg_match = re.search(r'```(?:xml|svg)?\s*\n(.*?)\n```', svg_code, re.DOTALL)
+    目标：
+    - 可靠提取 SVG（支持 markdown 代码块/前后噪声）
+    - XML 解析通过；根节点必须是 <svg>
+    - 补齐 viewBox（必要时）
+    - 移除“全画布背景矩形/面板”（包括嵌套在 <g> 内的 rect）
+    - 移除高风险与低兼容元素（脚本、外链、foreignObject 等）
+    """
+    import re
+    import xml.etree.ElementTree as ET
+
+    # 1) 提取 SVG（markdown 代码块 + 容错截取首个 <svg>... </svg>）
+    svg_match = re.search(r"```(?:xml|svg)?\s*\n(.*?)\n```", svg_code, re.DOTALL)
     if svg_match:
         svg_code = svg_match.group(1)
+    if "<svg" in svg_code and "</svg>" in svg_code:
+        svg_code = svg_code[svg_code.find("<svg"): svg_code.rfind("</svg>") + len("</svg>")]
 
-    # 2. 验证 XML 语法
+    # 2) XML 解析
     try:
-        root = ET.fromstring(svg_code)
+        root = ET.fromstring(svg_code.strip())
     except ET.ParseError as e:
         raise ValueError(f"Invalid SVG XML: {e}")
 
-    # 3. 确保有 xmlns 命名空间
-    if 'xmlns' not in root.attrib:
-        root.attrib['xmlns'] = 'http://www.w3.org/2000/svg'
+    # 3) 根节点必须是 svg（兼容带命名空间与不带命名空间）
+    root_tag = root.tag.split("}", 1)[-1].lower()
+    if root_tag != "svg":
+        raise ValueError("Root element is not <svg>")
 
-    # 4. 确保有 viewBox（如果没有则根据 width/height 添加）
-    if 'viewBox' not in root.attrib:
-        width = root.attrib.get('width', '1920')
-        height = root.attrib.get('height', '1080')
-        root.attrib['viewBox'] = f"0 0 {width} {height}"
+    # 兜底补齐 xmlns（用于规范化输出；查找元素时不要依赖是否带命名空间）
+    if "xmlns" not in root.attrib:
+        root.attrib["xmlns"] = "http://www.w3.org/2000/svg"
 
-    # 5. 移除背景矩形（如果存在）
-    for rect in root.findall('.//{http://www.w3.org/2000/svg}rect'):
-        # 检查是否是全画布背景
-        vb = root.attrib.get('viewBox', '0 0 1920 1080').split()
-        if (rect.attrib.get('x', '0') == '0' and
-            rect.attrib.get('y', '0') == '0' and
-            rect.attrib.get('width') == vb[2] and
-            rect.attrib.get('height') == vb[3]):
-            root.remove(rect)
+    # 4) viewBox 兜底（PPT/缩放需要）
+    if "viewBox" not in root.attrib:
+        width = root.attrib.get("width", "1920")
+        height = root.attrib.get("height", "1080")
+        # width/height 可能带单位（px），实现时需做解析/净化
+        root.attrib["viewBox"] = f"0 0 {width} {height}"
 
-    # 6. 转换回字符串
-    return ET.tostring(root, encoding='unicode')
+    # 5) 安全净化（示意）：移除脚本/外链/事件属性/foreignObject
+    # 实现建议：tag 白名单 + 属性白名单；对 <image> 仅允许 data: URI。
+
+    # 6) 移除“全画布背景 rect”（必须支持嵌套删除）
+    parent_map = {c: p for p in root.iter() for c in p}
+    vb = root.attrib.get("viewBox", "0 0 1920 1080").split()
+    vb_w, vb_h = (vb[2], vb[3]) if len(vb) == 4 else ("1920", "1080")
+
+    def _is_full_canvas_rect(el: ET.Element) -> bool:
+        if el.tag.split("}", 1)[-1].lower() != "rect":
+            return False
+        return (
+            el.attrib.get("x", "0") in ("0", "0px")
+            and el.attrib.get("y", "0") in ("0", "0px")
+            and el.attrib.get("width") in (vb_w, f"{vb_w}px")
+            and el.attrib.get("height") in (vb_h, f"{vb_h}px")
+        )
+
+    for el in list(root.iter()):
+        if _is_full_canvas_rect(el):
+            parent = parent_map.get(el)
+            if parent is not None:
+                parent.remove(el)
+
+    return ET.tostring(root, encoding="unicode")
 ```
 
 ### 1.5 SVG 转 PNG（可选备份）
 
 ```python
 def svg_to_png(svg_path: str, png_path: str, width: int = 1920, height: int = 1080):
-    """将 SVG 转换为 PNG（使用 cairosvg 或 Pillow）"""
+    """
+    将 SVG 转换为 PNG（用于：
+    - 生成 slides.pdf（当前实现仅支持位图）
+    - 兼容旧版 Office / 不支持 SVG 的场景
+    ）
+
+    注意：仓库当前 requirements.txt 未包含下述依赖，若启用该路径需补齐依赖并在文档中写清。
+    """
     try:
         import cairosvg
         cairosvg.svg2png(
@@ -180,7 +247,7 @@ def svg_to_png(svg_path: str, png_path: str, width: int = 1920, height: int = 10
             background_color=None  # 透明背景
         )
     except ImportError:
-        # 备选方案：使用 Pillow + svglib
+        # 备选方案：使用 svglib + reportlab（需要额外依赖 svglib）
         from svglib.svglib import svg2rlg
         from reportlab.graphics import renderPM
         drawing = svg2rlg(svg_path)
@@ -191,7 +258,7 @@ def svg_to_png(svg_path: str, png_path: str, width: int = 1920, height: int = 10
 
 ### 2.1 配置选项
 
-扩展 `GenerationConfig` 类：
+扩展 `GenerationConfig` 类（当前文件为 `paper2slides/generator/config.py`，已存在 `transparent_bg` 等字段）：
 
 ```python
 @dataclass
@@ -199,16 +266,21 @@ class GenerationConfig:
     # 现有字段...
 
     # 输出格式配置
-    output_format: str = "svg"  # "svg" | "png" | "both"
+    output_format: str = "png"  # "svg" | "png" | "both"（默认保持现有 PNG 行为）
     svg_export_png: bool = True  # SVG 模式下是否同时导出 PNG
     svg_viewbox_width: int = 1920
     svg_viewbox_height: int = 1080
 ```
 
+配置交互约束（建议写死在实现与 CLI help 中，避免歧义）：
+- `output_format=png`：走现有位图生成链路；如需透明背景仍使用 `transparent_bg` 与后处理。
+- `output_format=svg`：生成 `.svg`；若 `svg_export_png=true`，则从 SVG 栅格化得到 `.png`（透明 alpha），并用于生成 `slides.pdf`。
+- `output_format=both`：建议定义为“保存 `.svg` + 从 SVG 栅格化得到 `.png`”，确保一致且便于生成 `slides.pdf`。
+
 ### 2.2 命令行参数
 
 ```bash
-# 基础用法（默认 SVG）
+# 基础用法（默认 PNG，保持现有行为）
 python -m paper2slides --input paper.pdf --output slides
 
 # 明确指定格式
@@ -231,7 +303,7 @@ class GenerationConfig:
     # ... 现有字段
 
     # 输出格式配置（新增）
-    output_format: str = "svg"  # "svg" | "png" | "both"
+    output_format: str = "png"  # "svg" | "png" | "both"（默认保持现有 PNG 行为）
     svg_export_png: bool = True
     svg_viewbox_width: int = 1920
     svg_viewbox_height: int = 1080
@@ -239,77 +311,35 @@ class GenerationConfig:
 
 #### 文件2: `paper2slides/generator/image_generator.py`
 
-**修改点1**: 添加 SVG 生成方法
+**修改点1**: 添加 SVG 生成与清理（文本返回）
+
+目标是尽量保持现有“返回 bytes + mime_type”的结构：SVG 作为 UTF-8 文本 bytes 返回，并标注 `mime_type="image/svg+xml"`，由 `generate_stage.py` 负责落盘。
 
 ```python
-def _generate_svg(self, prompt: str) -> str:
-    """生成 SVG 代码"""
-    # 构建完整提示词
+def _generate_svg_bytes(self, prompt: str, reference_images: list[dict]) -> tuple[bytes, str]:
     full_prompt = f"{prompt}\n\n{SVG_GENERATION_PROMPT}"
-
-    # 调用 LLM（使用文本生成而非图像生成）
-    response = self.llm_client.generate_text(
-        prompt=full_prompt,
-        max_tokens=8000,  # SVG 代码可能较长
-        temperature=0.7
-    )
-
-    # 验证和清理
-    svg_code = validate_and_clean_svg(response)
-
-    return svg_code
+    svg_text = self._call_model_for_text(full_prompt, reference_images)
+    cleaned = validate_and_clean_svg(svg_text)
+    return cleaned.encode("utf-8"), "image/svg+xml"
 ```
 
-**修改点2**: 修改生成流程
+**修改点2**: 与现有 poster/slides 生成流程对齐
 
-```python
-def generate_slide(self, slide_data: dict, index: int) -> str:
-    """生成单个幻灯片"""
-    prompt = self._build_slide_prompt(slide_data, index)
+- 在 `_generate_poster()` / `_generate_slides()` 内，根据 `config.output_format` 分支调用 `_generate_svg_bytes()`（SVG）或现有 `_call_model()`（PNG/JPEG/WEBP）。
+- 对 slides 的并行路径（ThreadPoolExecutor）同样需要按 `output_format` 分支，保证行为一致。
 
-    if self.config.output_format == "svg":
-        # 生成 SVG
-        svg_code = self._generate_svg(prompt)
-        svg_path = self._save_svg(svg_code, index)
+**修改点3**: `both` 与 `slides.pdf` 的闭环建议放在 `generate_stage.py`
 
-        # 可选：导出 PNG
-        if self.config.svg_export_png:
-            png_path = svg_path.replace('.svg', '.png')
-            svg_to_png(svg_path, png_path)
-
-        return svg_path
-
-    elif self.config.output_format == "png":
-        # 原有 PNG 生成流程
-        return self._generate_png(prompt, index)
-
-    else:  # "both"
-        svg_path = self._generate_svg(prompt)
-        png_path = self._generate_png(prompt, index)
-        return svg_path
-```
-
-**修改点3**: 添加 SVG 保存方法
-
-```python
-def _save_svg(self, svg_code: str, index: int) -> str:
-    """保存 SVG 文件"""
-    output_dir = self.paths.get_output_dir()
-    svg_path = output_dir / f"slide_{index:02d}.svg"
-
-    with open(svg_path, 'w', encoding='utf-8') as f:
-        f.write(svg_code)
-
-    logger.info(f"Saved SVG: {svg_path}")
-    return str(svg_path)
-```
+由于当前 `save_images_as_pdf()` 只能处理位图：
+- `output_format=svg && svg_export_png=true`：在 `generate_stage.py` 落盘 SVG 后，再调用 `svg_to_png()` 生成 PNG（用于 PDF 与降级）。
+- `output_format=svg && svg_export_png=false`：slides 模式应跳过 `slides.pdf`，并在日志/返回值中提示。
 
 #### 文件3: `paper2slides/main.py`
 
 ```python
 # 添加命令行参数
-parser.add_argument('--format', choices=['svg', 'png', 'both'], default='svg',
-                    help='Output format (default: svg)')
+parser.add_argument('--format', choices=['svg', 'png', 'both'], default='png',
+                    help='Output format (default: png)')
 parser.add_argument('--no-png-export', action='store_true',
                     help='Do not export PNG when using SVG format')
 parser.add_argument('--viewbox', type=str, default='1920x1080',
@@ -330,28 +360,27 @@ config = GenerationConfig(
 
 ### 2.4 LLM API 适配
 
-由于 SVG 生成需要文本输出而非图像输出，需要适配 LLM API：
+由于 SVG 生成需要文本输出而非图像输出，需要适配 LLM API（建议在 `ImageGenerator` 内新增 `_call_model_for_text()`）：
 
-```python
-class ImageGenerator:
-    def __init__(self, config: GenerationConfig):
-        self.config = config
+1) **OpenRouter**：当前实现只解析 `message.images`。需要新增：
+- 当 `IMAGE_GEN_RESPONSE_MIME_TYPE` 为 `text/plain`（或 `output_format=svg`）时，从 `response.choices[0].message.content` 读取文本。
+- 参考图片输入方式不变（仍可传 figures 作为 `image_url`）。
 
-        # 图像生成客户端（用于 PNG）
-        self.image_client = self._init_image_client()
+2) **Google Gemini**：当前实现会解析 `inlineData` 或“base64 in text”。SVG 模式应：
+- 将 `generationConfig.responseMimeType` 设为 `text/plain`（并在 prompt 中要求直接输出 `<svg ...>` 文本）。
+- 从 `candidates[0].content.parts[].text` 拼接得到 SVG 文本。
 
-        # 文本生成客户端（用于 SVG）
-        self.text_client = self._init_text_client()
+### 2.5 输出与 PDF 行为（必须在实现/文档中写清）
 
-    def _init_text_client(self):
-        """初始化文本生成客户端"""
-        # 使用相同的 API 配置，但调用文本生成端点
-        return LLMClient(
-            api_key=os.getenv("IMAGE_GEN_API_KEY"),
-            base_url=os.getenv("IMAGE_GEN_BASE_URL"),
-            model=os.getenv("IMAGE_GEN_MODEL", "google/gemini-2.0-flash-exp"),
-        )
-```
+当前 `paper2slides/generator/image_generator.py` 的 `save_images_as_pdf()` 只能处理位图（PIL 打开 bytes 后转 RGB），因此：
+- `output_format=svg && svg_export_png=false`：slides 模式应跳过 `slides.pdf` 生成，或给出明确错误提示。
+- `output_format=svg && svg_export_png=true`：用 SVG 栅格化得到 PNG 后再生成 PDF（确保闭环）。
+- `output_format=both`：建议定义为“保存 SVG + 从 SVG 栅格化得到 PNG”，避免同一页出现两套不一致的视觉结果。
+
+同时需要在 `paper2slides/core/stages/generate_stage.py` 中补齐：
+- 将 `image/svg+xml` 映射为 `.svg` 扩展名并正确落盘。
+- 若启用 `svg_export_png`，在落盘后执行 `svg_to_png()` 并将生成的 PNG 纳入 `slides.pdf` 合成输入。
+- Web/API 展示：如需在前端预览 SVG，务必使用“已净化的 SVG”，并优先用 `<img src="...">` 展示（避免 `<object>`/`<iframe>` 执行外部资源）。
 
 ## 3. 优势分析
 
@@ -370,7 +399,8 @@ class ImageGenerator:
    - 适配任何屏幕分辨率
 
 4. **文件体积小**
-   - 文本描述的图形，通常比位图小 5-10 倍
+   - 纯矢量（文字/形状/路径）通常比位图更小
+   - 若大量嵌入 `<image>` base64，文件可能反而变大，需要在提示词与实现中约束
    - 减少存储和传输成本
 
 5. **可编辑性强**
@@ -380,8 +410,8 @@ class ImageGenerator:
 ### 3.2 用户体验优势
 
 1. **PPT 兼容性更好**
-   - PowerPoint 原生支持 SVG（Office 2016+）
-   - 插入后可直接编辑和调整
+   - PowerPoint 原生支持 SVG（Office 2016+），但支持的是 SVG 子集
+   - 需要在提示词与净化中限制：避免滤镜/外链/foreignObject 等，以减少渲染差异
 
 2. **打印质量更高**
    - 矢量图形打印不失真
@@ -401,6 +431,7 @@ class ImageGenerator:
 | 复杂图表难以生成 | 中 | 高 | 提供图表模板 + 混合模式（图表用图片嵌入） |
 | 字体兼容性问题 | 中 | 中 | 使用 web-safe 字体 + 字体嵌入 |
 | 旧版 Office 不支持 | 低 | 低 | 同时导出 PNG 备份 |
+| SVG 安全与渲染风险（Web/浏览器） | 中 | 中 | 生成后做安全净化（移除脚本/外链/事件/foreignObject），再提供下载/预览 |
 
 ### 4.2 实施风险
 
@@ -464,21 +495,34 @@ class ImageGenerator:
 ### 5.2 验收标准
 
 1. **功能完整性**
-   - ✓ 能生成有效的 SVG 文件
-   - ✓ SVG 背景透明
-   - ✓ 支持 SVG/PNG/Both 三种模式
-   - ✓ SVG 可在 PowerPoint 中正常显示
+   - 能生成有效的 SVG 文件
+   - SVG 背景透明（无全画布背景面板）
+   - 支持 SVG/PNG/Both 三种模式（需明确 both 的 PNG 来源）
+   - SVG 可在 PowerPoint 2016+ 中正常显示（以“PPT 支持的 SVG 子集”为准）
 
 2. **质量标准**
-   - ✓ SVG 语法正确，无错误
-   - ✓ 文字清晰可读
-   - ✓ 边缘平滑无锯齿
-   - ✓ 文件大小合理（< 500KB/页）
+   - SVG 语法正确，可被解析
+   - 文字清晰可读（优先用描边/双层文字，避免依赖滤镜）
+   - 常见图形边缘平滑（矢量路径）
+   - 文件大小合理（建议设软阈值；含嵌入图片时允许更大并给出告警）
 
 3. **兼容性**
-   - ✓ PowerPoint 2016+ 支持
-   - ✓ 现代浏览器支持
-   - ✓ 向后兼容 PNG 模式
+   - PowerPoint 2016+ 支持（限制在 SVG 子集）
+   - 现代浏览器支持（同时注意 SVG 的安全净化）
+   - 向后兼容 PNG 模式（必要时自动降级）
+
+### 5.3 测试建议（最小可行）
+
+单元测试（无需真实调用外部模型，可用固定样例字符串）：
+1. `validate_and_clean_svg()`：
+   - markdown 代码块/前后噪声提取
+   - 带/不带 xmlns 的 `<svg>`
+   - 背景 `<rect>` 在根节点与嵌套 `<g>` 两种情况均可移除
+   - 禁止元素与属性（`<script>`、`onload`、外链 `href="http..."`）被移除/拒绝
+2. SVG→PNG（若启用）：对给定 SVG 样例栅格化输出 PNG，并检查 alpha 存在（背景透明）。
+
+端到端测试（建议保留最小人工验收步骤）：
+- slides 模式：生成 `.svg` + `.png`，确认 `slides.pdf` 成功生成；导入 PowerPoint 验收（不同模板浅色/深色背景）。
 
 ## 6. 后续优化
 
@@ -516,18 +560,17 @@ class ImageGenerator:
    ```
 
 2. **文字描边提高可读性**
-   ```xml
-   <text fill="white" stroke="black" stroke-width="2">Text</text>
-   ```
+    ```xml
+    <!-- 推荐：双层文字（更接近 PPT 兼容子集） -->
+    <text fill="none" stroke="black" stroke-width="3">Text</text>
+    <text fill="white" stroke="none">Text</text>
+    ```
 
-3. **使用 <defs> 定义可复用元素**
+3. **避免滤镜，用简单元素做阴影/层次**
    ```xml
-   <defs>
-     <filter id="shadow">
-       <feDropShadow dx="2" dy="2" stdDeviation="3"/>
-     </filter>
-   </defs>
-   <text filter="url(#shadow)">Text</text>
+   <!-- 用“复制 + 位移 + 低透明度”模拟阴影（比 filter 更兼容） -->
+   <text x="102" y="202" fill="black" opacity="0.35">Text</text>
+   <text x="100" y="200" fill="white">Text</text>
    ```
 
 4. **优化路径数据**
