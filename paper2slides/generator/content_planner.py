@@ -8,6 +8,11 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
 from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables from project root
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 from .config import GenerationInput, OutputType
 from ..summary import FigureInfo, TableInfo
@@ -121,6 +126,14 @@ class ContentPlanner:
         self.api_key = api_key or os.getenv("RAG_LLM_API_KEY", "")
         self.base_url = base_url or os.getenv("RAG_LLM_BASE_URL")
         self.model = model or os.getenv("LLM_MODEL", "gpt-4o")
+
+        # Debug logging
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"ContentPlanner initialized:")
+        logger.info(f"  api_key: {self.api_key[:20]}..." if self.api_key else "  api_key: None")
+        logger.info(f"  base_url: {self.base_url}")
+        logger.info(f"  model: {self.model}")
         
         kwargs = {"api_key": self.api_key}
         if self.base_url:
@@ -293,6 +306,8 @@ class ContentPlanner:
         
         try:
             logger.info(f"Calling {self.model} with max_tokens=16000")
+            logger.info(f"Client base_url: {self.client.base_url}")
+            logger.info(f"Self base_url: {self.base_url}")
 
             # 使用 requests 而不是 OpenAI 客户端
             import requests

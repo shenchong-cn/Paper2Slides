@@ -663,10 +663,18 @@ class ImageGenerator:
         except (SvgValidationError, ValueError) as e:
             if strict:
                 raise
+            # For Google provider, don't fallback to PNG as it's not supported
+            if self.provider == "google":
+                logger.error(f"SVG generation failed with Google API: {e}")
+                raise
             logger.warning(f"SVG validation failed; falling back to PNG: {e}")
             return self._call_model(prompt, reference_images)
         except Exception as e:
             if strict:
+                raise
+            # For Google provider, don't fallback to PNG as it's not supported
+            if self.provider == "google":
+                logger.error(f"SVG generation failed with Google API: {e}")
                 raise
             logger.warning(f"SVG generation failed; falling back to PNG: {e}")
             return self._call_model(prompt, reference_images)
@@ -1181,6 +1189,7 @@ class ImageGenerator:
             "gemini-1.5-pro",
             "gemini-1.5-flash-8b",
             "gemini-2.0-flash",
+            "gemini-3-pro-image-preview",
         )
         if wants_image and not model_key.startswith(image_capable_prefixes):
             raise ValueError(

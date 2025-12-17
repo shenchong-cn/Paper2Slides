@@ -46,7 +46,23 @@ def extract_svg(text: str) -> str:
     if start == -1 or end == -1 or end <= start:
         raise SvgValidationError("No <svg>...</svg> block found")
 
-    return text[start : end + len("</svg>")].strip()
+    svg_text = text[start : end + len("</svg>")].strip()
+
+    # Remove duplicate xmlns attributes
+    svg_match = re.search(r'<svg[^>]*>', svg_text)
+    if svg_match:
+        svg_tag = svg_match.group(0)
+        xmlns_pattern = r'\s+xmlns\s*=\s*["\'][^"\']*["\']'
+        xmlns_matches = re.findall(xmlns_pattern, svg_tag)
+        if len(xmlns_matches) > 1:
+            # Remove all xmlns attributes first
+            cleaned_tag = re.sub(xmlns_pattern, '', svg_tag)
+            # Add back the first xmlns
+            first_xmlns = xmlns_matches[0]
+            cleaned_tag = re.sub(r'<svg\s*', f'<svg{first_xmlns} ', cleaned_tag, count=1)
+            svg_text = svg_text.replace(svg_tag, cleaned_tag)
+
+    return svg_text
 
 
 def _local_name(tag: str) -> str:
@@ -143,6 +159,24 @@ def validate_and_clean_svg(svg_text: str, options: SvgSanitizeOptions) -> str:
     if "<!doctype" in lowered or "<!entity" in lowered:
         raise SvgValidationError("DOCTYPE/ENTITY is not allowed in SVG")
 
+    # Pre-process to remove duplicate xmlns attributes before parsing
+    # This handles cases where LLM outputs duplicate xmlns
+    import re
+    # Find the opening svg tag
+    svg_match = re.search(r'<svg[^>]*>', svg_code)
+    if svg_match:
+        svg_tag = svg_match.group(0)
+        # Remove duplicate xmlns attributes (keep only the first)
+        xmlns_pattern = r'\s+xmlns\s*=\s*["\'][^"\']*["\']'
+        xmlns_matches = re.findall(xmlns_pattern, svg_tag)
+        if len(xmlns_matches) > 1:
+            # Remove all xmlns attributes first
+            cleaned_tag = re.sub(xmlns_pattern, '', svg_tag)
+            # Add back the first xmlns after the svg tag name
+            first_xmlns = xmlns_matches[0]
+            cleaned_tag = re.sub(r'<svg\s*', f'<svg{first_xmlns} ', cleaned_tag, count=1)
+            svg_code = svg_code.replace(svg_tag, cleaned_tag)
+
     try:
         root = ET.fromstring(svg_code)
     except ET.ParseError as e:
@@ -152,8 +186,7 @@ def validate_and_clean_svg(svg_text: str, options: SvgSanitizeOptions) -> str:
         raise SvgValidationError("Root element is not <svg>")
 
     # Ensure namespaces exist for consistent serialization.
-    if "xmlns" not in root.attrib:
-        root.attrib["xmlns"] = _SVG_NS
+    # Register namespaces for proper serialization
     ET.register_namespace("", _SVG_NS)
     ET.register_namespace("xlink", _XLINK_NS)
 
